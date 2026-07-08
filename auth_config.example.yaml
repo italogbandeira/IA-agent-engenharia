@@ -1,0 +1,10 @@
+credentials:
+  usernames:
+    usuario_exemplo:
+      email: usuario_exemplo@example.com
+      name: Nome Exemplo
+      password: <HASH_BCRYPT_GERADO>
+cookie:
+  name: agente_normas_auth
+  key: <chave_aleatoria_gerada_com_secrets.token_hex(32)>
+  expiry_days: 7

@@ -4,6 +4,7 @@ o modelo apenas gera a resposta com base no contexto fornecido.
 Uso: python agente.py
 """
 
+import json
 import re
 import sys
 from typing import Generator
@@ -19,6 +20,8 @@ GEN_MODEL = "llama3.1:8b"
 NUM_CTX = 16384
 HISTORICO_MAX = 6  # pares user+assistant mantidos no histórico
 LIMIAR_SIMILARIDADE = 0.50
+NUM_CTX_COMPARACAO = 32768
+CONTEXTO_MAX_CARACTERES_POR_LAUDO = 40000  # ~10k tokens por laudo, deixa espaço pros dois + resposta
 
 SYSTEM_PROMPT = (
     "Você é um assistente técnico especializado em normas e laudos de engenharia, "
@@ -75,6 +78,43 @@ _TERMOS_GERAL = {
 }
 
 _REGEX_CAMINHO_PDF = re.compile(r"[^\s\"']+\.pdf", re.IGNORECASE)
+
+APONTAMENTOS_SYSTEM_PROMPT = (
+    "Você é um engenheiro auditor especializado em normas técnicas ABNT e "
+    "regulamentações do Sistema CONFEA/CREA. Sua tarefa é analisar o texto de laudo(s) "
+    "de vistoria fornecido e extrair APENAS os apontamentos técnicos relevantes, "
+    "em formato JSON estrito, sem nenhum texto fora do JSON.\n\n"
+    "Para cada problema/patologia identificado, gere um item com:\n"
+    '- "problema": descrição objetiva do problema encontrado\n'
+    '- "norma_violada": norma técnica relacionada (ex.: "NBR 5674"), ou "Não identificada" '
+    "se o laudo não mencionar uma norma específica para esse problema\n"
+    '- "recomendacao": ação corretiva recomendada, extraída do laudo ou inferida tecnicamente\n'
+    '- "gravidade": "alta", "média" ou "baixa"\n\n'
+    "Responda SOMENTE com um JSON no formato:\n"
+    "{\n"
+    '  "resumo": "resumo geral do laudo em até 3 frases",\n'
+    '  "apontamentos": [\n'
+    '    {"problema": "...", "norma_violada": "...", "recomendacao": "...", "gravidade": "..."}\n'
+    "  ]\n"
+    "}\n\n"
+    'Se não houver problemas identificáveis no texto, retorne "apontamentos": []. '
+    "Não invente normas, números ou dados que não constam no texto fornecido."
+)
+
+COMPARACAO_SYSTEM_PROMPT = (
+    "Você é um engenheiro auditor especializado em laudos de vistoria predial e normas "
+    "técnicas ABNT. Você recebeu dois laudos do mesmo imóvel ou obra, feitos em datas "
+    "diferentes: um LAUDO ANTERIOR e um LAUDO ATUAL.\n\n"
+    "Compare os dois e apresente, em tópicos organizados por seção:\n"
+    "1. Novos apontamentos — problemas que aparecem no laudo atual e não estavam no anterior\n"
+    "2. Apontamentos resolvidos — problemas do laudo anterior que não aparecem mais no atual\n"
+    "3. Evolução de patologias — problemas presentes nos dois laudos, indicando se a "
+    "situação piorou, melhorou ou permanece igual, com base na descrição de cada laudo\n"
+    "4. Mudanças nas recomendações técnicas entre os dois laudos\n\n"
+    "Baseie-se apenas no texto fornecido. Nunca invente prazos, medições, normas ou dados "
+    "que não constem nos laudos. Se não for possível determinar a evolução de algum item "
+    "por falta de detalhe em um dos laudos, diga isso explicitamente em vez de supor."
+)
 
 
 def classificar_intencao(pergunta: str) -> str:
@@ -165,6 +205,40 @@ def gerar_resposta_com_contexto_stream(
         yield chunk["message"]["content"]
 
 
+def _truncar_laudo(texto: str) -> str:
+    if len(texto) > CONTEXTO_MAX_CARACTERES_POR_LAUDO:
+        return texto[:CONTEXTO_MAX_CARACTERES_POR_LAUDO] + "... [truncado]"
+    return texto
+
+
+def comparar_laudos_stream(
+    texto_laudo_anterior: str,
+    texto_laudo_atual: str,
+    nome_anterior: str,
+    nome_atual: str,
+) -> Generator[str, None, None]:
+    mensagem_user = (
+        f"[LAUDO ANTERIOR — {nome_anterior}]\n{_truncar_laudo(texto_laudo_anterior)}\n\n"
+        "---\n\n"
+        f"[LAUDO ATUAL — {nome_atual}]\n{_truncar_laudo(texto_laudo_atual)}"
+    )
+    mensagens = [
+        {"role": "system", "content": COMPARACAO_SYSTEM_PROMPT},
+        {"role": "user", "content": mensagem_user},
+    ]
+    stream = ollama.chat(
+        model=GEN_MODEL,
+        messages=mensagens,
+        options={
+            "temperature": 0.1,
+            "num_ctx": NUM_CTX_COMPARACAO,
+        },
+        stream=True,
+    )
+    for chunk in stream:
+        yield chunk["message"]["content"]
+
+
 def _gerar_resposta_conversacional(pergunta: str, historico: list[dict]) -> str:
     mensagens = (
         [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -201,6 +275,43 @@ def _gerar_resposta_conversacional_stream(
     )
     for chunk in stream:
         yield chunk["message"]["content"]
+
+
+def gerar_apontamentos(texto_laudo: str) -> dict:
+    """
+    Extrai apontamentos técnicos estruturados (problema, norma violada,
+    recomendação, gravidade) de um texto de laudo, em JSON.
+    Usado para montar o relatório de apontamentos em .docx.
+    """
+    mensagens = [
+        {"role": "system", "content": APONTAMENTOS_SYSTEM_PROMPT},
+        {"role": "user", "content": f"Texto do(s) laudo(s):\n\n{texto_laudo}"},
+    ]
+    resposta = ollama.chat(
+        model=GEN_MODEL,
+        messages=mensagens,
+        format="json",
+        options={
+            "temperature": 0.1,
+            "num_ctx": NUM_CTX,
+        },
+    )
+    conteudo = resposta["message"]["content"]
+
+    try:
+        dados = json.loads(conteudo)
+    except json.JSONDecodeError:
+        dados = {}
+
+    if not isinstance(dados, dict):
+        dados = {}
+
+    dados.setdefault("resumo", "")
+    dados.setdefault("apontamentos", [])
+    if not isinstance(dados["apontamentos"], list):
+        dados["apontamentos"] = []
+
+    return dados
 
 
 def executar_tarefa(tarefa: str, ferramentas: Ferramentas, historico: list[dict]) -> dict:

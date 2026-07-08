@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import tempfile
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -15,45 +16,60 @@ import chromadb
 import edge_tts
 import ollama
 import streamlit as st
+import streamlit_authenticator as stauth
 import whisper
+import yaml
+from yaml.loader import SafeLoader
 
 from agente import (
     LIMIAR_SIMILARIDADE,
     _REGEX_CAMINHO_PDF,
     _gerar_resposta_conversacional_stream,
     classificar_intencao,
+    comparar_laudos_stream,
+    gerar_apontamentos,
     gerar_resposta_com_contexto_stream,
     reescrever_pergunta,
 )
 from ferramentas import EMBED_MODEL, Ferramentas
 from ingestao import dividir_em_chunks, ingerir_pdfs
+from relatorio import gerar_relatorio_docx
+
+AUTENTICACAO_ATIVA = False  # TODO: reativar depois de corrigir o hash em auth_config.yaml
 
 CHROMA_DIR = "chroma_db"
 COLLECTION_NAME = "normas"
 PASTA_DOCUMENTOS = Path("documentos")
 MENSAGEM_ANALISE = "analise os documentos anexados"
-ARQUIVO_FEEDBACK = Path("feedback.jsonl")
 VOZ_TTS = "pt-BR-FranciscaNeural"
 CAMINHO_AUDIO_RESPOSTA = "temp_audio_resposta.mp3"
 CHUNK_SIZE_UPLOAD = 300
 CHUNK_OVERLAP_UPLOAD = 100
-ARQUIVO_HISTORICO = Path("historico_conversa.json")
 HISTORICO_MAX_MENSAGENS = 50
 
 
-def carregar_historico() -> list[dict]:
+def arquivo_historico(username: str) -> Path:
+    return Path(f"historico_{username}.json")
+
+
+def arquivo_feedback(username: str) -> Path:
+    return Path(f"feedback_{username}.jsonl")
+
+
+def carregar_historico(username: str) -> list[dict]:
     try:
-        if ARQUIVO_HISTORICO.exists():
-            with open(ARQUIVO_HISTORICO, "r", encoding="utf-8") as f:
+        caminho = arquivo_historico(username)
+        if caminho.exists():
+            with open(caminho, "r", encoding="utf-8") as f:
                 return json.load(f)
     except Exception:
         pass
     return []
 
 
-def salvar_historico(historico: list[dict]):
+def salvar_historico(username: str, historico: list[dict]):
     try:
-        with open(ARQUIVO_HISTORICO, "w", encoding="utf-8") as f:
+        with open(arquivo_historico(username), "w", encoding="utf-8") as f:
             json.dump(historico[-HISTORICO_MAX_MENSAGENS:], f, indent=2, ensure_ascii=False)
     except Exception:
         pass
@@ -121,6 +137,31 @@ def texto_para_audio(texto: str, caminho_saida: str):
 
 
 st.set_page_config(page_title="Agente de Normas Técnicas")
+
+if AUTENTICACAO_ATIVA:
+    with open("auth_config.yaml", encoding="utf-8") as f:
+        config_auth = yaml.load(f, Loader=SafeLoader)
+
+    authenticator = stauth.Authenticate(
+        config_auth["credentials"],
+        config_auth["cookie"]["name"],
+        config_auth["cookie"]["key"],
+        config_auth["cookie"]["expiry_days"],
+        auto_hash=False,
+    )
+
+    authenticator.login(location="main")
+
+    if st.session_state.get("authentication_status") is False:
+        st.error("Usuário ou senha incorretos.")
+        st.stop()
+    elif st.session_state.get("authentication_status") is None:
+        st.warning("Informe usuário e senha para acessar.")
+        st.stop()
+else:
+    st.session_state.setdefault("username", "local")
+    st.session_state.setdefault("name", "Usuário local")
+
 st.title("Agente de Normas Técnicas")
 st.caption("Consulte normas, analise laudos e tire dúvidas técnicas")
 
@@ -133,7 +174,7 @@ except Exception:
     st.stop()
 
 if "historico" not in st.session_state:
-    st.session_state.historico = carregar_historico()
+    st.session_state.historico = carregar_historico(st.session_state["username"])
 if "arquivos_salvos" not in st.session_state:
     st.session_state.arquivos_salvos = []
 if "disparar_analise" not in st.session_state:
@@ -148,11 +189,30 @@ if "processando" not in st.session_state:
     st.session_state.processando = False
 if "mostrar_opcao_indexar" not in st.session_state:
     st.session_state.mostrar_opcao_indexar = False
+if "mostrar_opcao_relatorio" not in st.session_state:
+    st.session_state.mostrar_opcao_relatorio = False
+if "contexto_ultimo_laudo" not in st.session_state:
+    st.session_state.contexto_ultimo_laudo = ""
+if "arquivos_ultimo_laudo" not in st.session_state:
+    st.session_state.arquivos_ultimo_laudo = []
+if "relatorio_bytes" not in st.session_state:
+    st.session_state.relatorio_bytes = None
+if "ultima_comparacao" not in st.session_state:
+    st.session_state.ultima_comparacao = None
 
 with st.sidebar:
+    if AUTENTICACAO_ATIVA:
+        st.caption(f"👤 Logado como: {st.session_state.get('name', '')}")
+        authenticator.logout("🚪 Sair", location="sidebar")
+        st.divider()
+
     if st.button("🗑️ Limpar conversa"):
         st.session_state.historico = []
-        ARQUIVO_HISTORICO.unlink(missing_ok=True)
+        arquivo_historico(st.session_state["username"]).unlink(missing_ok=True)
+        st.session_state.mostrar_opcao_relatorio = False
+        st.session_state.contexto_ultimo_laudo = ""
+        st.session_state.arquivos_ultimo_laudo = []
+        st.session_state.relatorio_bytes = None
         st.rerun()
 
     st.divider()
@@ -284,6 +344,7 @@ def analisar_documentos_anexados(
 ):
     blocos = []
     fontes = []
+    nomes_arquivos = []
     for caminho in caminhos:
         resultado = ferramentas.ler_documento(str(caminho))
         if "erro" in resultado:
@@ -291,8 +352,21 @@ def analisar_documentos_anexados(
         else:
             blocos.append(f"[Documento: {resultado['arquivo']}]\n{resultado['texto']}")
             fontes.append({"arquivo": resultado["arquivo"], "trecho": "documento completo"})
+            nomes_arquivos.append(resultado["arquivo"])
     contexto = "\n\n---\n\n".join(blocos)
-    return gerar_resposta_com_contexto_stream(tarefa, contexto, historico), fontes
+    return gerar_resposta_com_contexto_stream(tarefa, contexto, historico), fontes, contexto, nomes_arquivos
+
+
+def _salvar_temp_comparacao(arquivo_anterior, arquivo_atual) -> tuple[Path, Path]:
+    PASTA_DOCUMENTOS.mkdir(exist_ok=True)
+    sufixo = datetime.now().strftime("%Y%m%d%H%M%S")
+    caminho_anterior = PASTA_DOCUMENTOS / f"comparacao_{sufixo}_anterior_{arquivo_anterior.name}"
+    caminho_atual = PASTA_DOCUMENTOS / f"comparacao_{sufixo}_atual_{arquivo_atual.name}"
+    with open(caminho_anterior, "wb") as f:
+        f.write(arquivo_anterior.getbuffer())
+    with open(caminho_atual, "wb") as f:
+        f.write(arquivo_atual.getbuffer())
+    return caminho_anterior, caminho_atual
 
 
 def indexar_documentos_anexados(caminhos: list[Path], ferramentas: Ferramentas) -> bool:
@@ -342,6 +416,40 @@ def indexar_documentos_anexados(caminhos: list[Path], ferramentas: Ferramentas) 
     return algum_indexado
 
 
+def calcular_tamanho_pasta_mb(pasta: str) -> float:
+    total_bytes = 0
+    for raiz, _, arquivos in os.walk(pasta):
+        for nome in arquivos:
+            caminho = os.path.join(raiz, nome)
+            total_bytes += os.path.getsize(caminho)
+    return total_bytes / (1024 * 1024)
+
+
+def contar_feedbacks(username: str) -> int:
+    caminho = arquivo_feedback(username)
+    if not caminho.exists():
+        return 0
+    with open(caminho, "r", encoding="utf-8") as f:
+        return sum(1 for linha in f if linha.strip())
+
+
+def carregar_feedbacks(username: str) -> list[dict]:
+    caminho = arquivo_feedback(username)
+    if not caminho.exists():
+        return []
+    registros = []
+    with open(caminho, "r", encoding="utf-8") as f:
+        for linha in f:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registros.append(json.loads(linha))
+            except json.JSONDecodeError:
+                continue
+    return registros
+
+
 def exibir_fontes(fontes: list[dict]):
     if not fontes:
         return
@@ -353,7 +461,7 @@ def exibir_fontes(fontes: list[dict]):
             st.markdown(linha)
 
 
-def salvar_feedback(pergunta: str, resposta: str, fontes: list[dict], avaliacao: str):
+def salvar_feedback(username: str, pergunta: str, resposta: str, fontes: list[dict], avaliacao: str):
     registro = {
         "timestamp": datetime.now().isoformat(),
         "pergunta": pergunta,
@@ -361,7 +469,7 @@ def salvar_feedback(pergunta: str, resposta: str, fontes: list[dict], avaliacao:
         "fontes": [fonte["arquivo"] for fonte in fontes],
         "avaliacao": avaliacao,
     }
-    with open(ARQUIVO_FEEDBACK, "a", encoding="utf-8") as f:
+    with open(arquivo_feedback(username), "a", encoding="utf-8") as f:
         f.write(json.dumps(registro, ensure_ascii=False) + "\n")
 
 
@@ -371,107 +479,249 @@ def exibir_feedback(indice: int, pergunta: str, resposta: str, fontes: list[dict
     col1, col2 = st.columns([1, 1])
     with col1:
         if st.button("👍 Útil", key=f"feedback_util_{indice}"):
-            salvar_feedback(pergunta, resposta, fontes, "positiva")
+            salvar_feedback(st.session_state["username"], pergunta, resposta, fontes, "positiva")
             st.session_state.feedback_enviado = True
             st.toast("Obrigado pelo feedback!")
             st.rerun()
     with col2:
         if st.button("👎 Não útil", key=f"feedback_nao_util_{indice}"):
-            salvar_feedback(pergunta, resposta, fontes, "negativa")
+            salvar_feedback(st.session_state["username"], pergunta, resposta, fontes, "negativa")
             st.session_state.feedback_enviado = True
             st.toast("Anotado. Vamos melhorar!")
             st.rerun()
 
 
-for indice, mensagem in enumerate(st.session_state.historico):
-    with st.chat_message(mensagem["role"]):
-        st.markdown(mensagem["content"])
-        if mensagem["role"] == "assistant":
-            exibir_fontes(mensagem.get("fontes", []))
-            if indice == len(st.session_state.historico) - 1:
-                pergunta_anterior = (
-                    st.session_state.historico[indice - 1]["content"] if indice > 0 else ""
-                )
-                exibir_feedback(
-                    indice, pergunta_anterior, mensagem["content"], mensagem.get("fontes", [])
-                )
+tab_chat, tab_admin, tab_comparar = st.tabs(["💬 Chat", "⚙️ Administração", "🔍 Comparar Laudos"])
 
-tarefa = None
-if st.session_state.disparar_analise:
-    tarefa = MENSAGEM_ANALISE
-    st.session_state.disparar_analise = False
+with tab_chat:
+    for indice, mensagem in enumerate(st.session_state.historico):
+        with st.chat_message(mensagem["role"]):
+            st.markdown(mensagem["content"])
+            if mensagem["role"] == "assistant":
+                exibir_fontes(mensagem.get("fontes", []))
+                if indice == len(st.session_state.historico) - 1:
+                    pergunta_anterior = (
+                        st.session_state.historico[indice - 1]["content"] if indice > 0 else ""
+                    )
+                    exibir_feedback(
+                        indice, pergunta_anterior, mensagem["content"], mensagem.get("fontes", [])
+                    )
 
-if st.session_state.tarefa_por_voz:
-    tarefa = st.session_state.tarefa_por_voz
-    st.session_state.tarefa_por_voz = None
+    tarefa = None
+    if st.session_state.disparar_analise:
+        tarefa = MENSAGEM_ANALISE
+        st.session_state.disparar_analise = False
 
-tarefa = st.chat_input("Digite sua pergunta...") or tarefa
+    if st.session_state.tarefa_por_voz:
+        tarefa = st.session_state.tarefa_por_voz
+        st.session_state.tarefa_por_voz = None
 
-if tarefa:
-    st.session_state.processando = True
-    st.session_state.feedback_enviado = False
+    tarefa = st.chat_input("Digite sua pergunta...") or tarefa
 
-    with st.chat_message("user"):
-        st.markdown(tarefa)
+    if tarefa:
+        st.session_state.processando = True
+        st.session_state.feedback_enviado = False
 
-    with st.chat_message("assistant"):
-        if tarefa == MENSAGEM_ANALISE and st.session_state.arquivos_salvos:
-            stream_generator, fontes = analisar_documentos_anexados(
-                tarefa,
-                ferramentas,
-                st.session_state.historico,
-                st.session_state.arquivos_salvos,
-            )
-        else:
-            stream_generator, fontes = processar_pergunta(
-                tarefa, ferramentas, st.session_state.historico
-            )
-        resposta = st.write_stream(stream_generator)
-        if not isinstance(resposta, str):
-            resposta = "".join(resposta)
-        exibir_fontes(fontes)
+        with st.chat_message("user"):
+            st.markdown(tarefa)
 
-        if tarefa == MENSAGEM_ANALISE and st.session_state.arquivos_salvos:
-            st.session_state.mostrar_opcao_indexar = True
-
-        if ler_respostas_em_voz:
-            try:
-                texto_para_audio(resposta, CAMINHO_AUDIO_RESPOSTA)
-                with open(CAMINHO_AUDIO_RESPOSTA, "rb") as f:
-                    st.audio(f.read(), format="audio/mp3", autoplay=True)
-            except Exception as e:
-                st.error(f"Erro ao gerar áudio da resposta: {e}")
-
-        st.session_state.historico.append({"role": "user", "content": tarefa})
-        st.session_state.historico.append(
-            {"role": "assistant", "content": resposta, "fontes": fontes}
-        )
-        salvar_historico(st.session_state.historico)
-        st.session_state.processando = False
-        indice_nova_resposta = len(st.session_state.historico) - 1
-        exibir_feedback(indice_nova_resposta, tarefa, resposta, fontes)
-
-if st.session_state.mostrar_opcao_indexar and st.session_state.arquivos_salvos:
-    st.info(
-        "💾 Deseja adicionar esse documento à base de conhecimento para consultas futuras?"
-    )
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        if st.button("✅ Sim, indexar"):
-            algum_indexado = indexar_documentos_anexados(
-                st.session_state.arquivos_salvos, ferramentas
-            )
-            st.session_state.mostrar_opcao_indexar = False
-            if algum_indexado:
-                st.cache_resource.clear()
-                st.success(
-                    "✅ Documento indexado com sucesso! Agora faz parte da base de conhecimento."
+        with st.chat_message("assistant"):
+            if tarefa == MENSAGEM_ANALISE and st.session_state.arquivos_salvos:
+                stream_generator, fontes, contexto_laudo, nomes_laudo = analisar_documentos_anexados(
+                    tarefa,
+                    ferramentas,
+                    st.session_state.historico,
+                    st.session_state.arquivos_salvos,
                 )
             else:
-                st.info("Esse documento já estava indexado na base de conhecimento.")
-            st.rerun()
-    with col2:
-        if st.button("❌ Não"):
-            st.session_state.mostrar_opcao_indexar = False
-            st.toast("Documento não indexado.")
-            st.rerun()
+                stream_generator, fontes = processar_pergunta(
+                    tarefa, ferramentas, st.session_state.historico
+                )
+            resposta = st.write_stream(stream_generator)
+            if not isinstance(resposta, str):
+                resposta = "".join(resposta)
+            exibir_fontes(fontes)
+
+            if tarefa == MENSAGEM_ANALISE and st.session_state.arquivos_salvos:
+                st.session_state.mostrar_opcao_indexar = True
+                st.session_state.mostrar_opcao_relatorio = True
+                st.session_state.contexto_ultimo_laudo = contexto_laudo
+                st.session_state.arquivos_ultimo_laudo = nomes_laudo
+                st.session_state.relatorio_bytes = None
+
+            if ler_respostas_em_voz:
+                try:
+                    texto_para_audio(resposta, CAMINHO_AUDIO_RESPOSTA)
+                    with open(CAMINHO_AUDIO_RESPOSTA, "rb") as f:
+                        st.audio(f.read(), format="audio/mp3", autoplay=True)
+                except Exception as e:
+                    st.error(f"Erro ao gerar áudio da resposta: {e}")
+
+            st.session_state.historico.append({"role": "user", "content": tarefa})
+            st.session_state.historico.append(
+                {"role": "assistant", "content": resposta, "fontes": fontes}
+            )
+            salvar_historico(st.session_state["username"], st.session_state.historico)
+            st.session_state.processando = False
+            indice_nova_resposta = len(st.session_state.historico) - 1
+            exibir_feedback(indice_nova_resposta, tarefa, resposta, fontes)
+
+    if st.session_state.mostrar_opcao_indexar and st.session_state.arquivos_salvos:
+        st.info(
+            "💾 Deseja adicionar esse documento à base de conhecimento para consultas futuras?"
+        )
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("✅ Sim, indexar"):
+                algum_indexado = indexar_documentos_anexados(
+                    st.session_state.arquivos_salvos, ferramentas
+                )
+                st.session_state.mostrar_opcao_indexar = False
+                if algum_indexado:
+                    st.cache_resource.clear()
+                    st.success(
+                        "✅ Documento indexado com sucesso! Agora faz parte da base de conhecimento."
+                    )
+                else:
+                    st.info("Esse documento já estava indexado na base de conhecimento.")
+                st.rerun()
+        with col2:
+            if st.button("❌ Não"):
+                st.session_state.mostrar_opcao_indexar = False
+                st.toast("Documento não indexado.")
+                st.rerun()
+
+    if st.session_state.mostrar_opcao_relatorio and st.session_state.contexto_ultimo_laudo:
+        st.divider()
+        st.subheader("📝 Relatório de apontamentos")
+
+        if st.button("📝 Gerar relatório de apontamentos (.docx)"):
+            with st.spinner("Extraindo apontamentos e montando o relatório..."):
+                try:
+                    dados_apontamentos = gerar_apontamentos(st.session_state.contexto_ultimo_laudo)
+                    st.session_state.relatorio_bytes = gerar_relatorio_docx(
+                        st.session_state.arquivos_ultimo_laudo, dados_apontamentos
+                    )
+                    qtd_apontamentos = len(dados_apontamentos.get("apontamentos", []))
+                    st.success(f"✅ Relatório gerado com {qtd_apontamentos} apontamento(s).")
+                except Exception as e:
+                    st.session_state.relatorio_bytes = None
+                    st.error(f"Erro ao gerar relatório: {e}")
+
+        if st.session_state.relatorio_bytes:
+            nome_relatorio = f"relatorio_apontamentos_{datetime.now().strftime('%Y%m%d_%H%M')}.docx"
+            st.download_button(
+                "⬇️ Baixar relatório",
+                data=st.session_state.relatorio_bytes,
+                file_name=nome_relatorio,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+
+with tab_admin:
+    st.subheader("📚 Documentos na base")
+
+    metadados_admin = ferramentas.colecao.get(include=["metadatas"])["metadatas"]
+    contagem_por_arquivo = Counter(meta["arquivo"] for meta in metadados_admin)
+    total_chunks_admin = sum(contagem_por_arquivo.values())
+
+    if not contagem_por_arquivo:
+        st.write("Nenhum documento indexado.")
+    else:
+        for arquivo, qtd_chunks in sorted(contagem_por_arquivo.items()):
+            percentual = (qtd_chunks / total_chunks_admin * 100) if total_chunks_admin else 0
+            col_nome, col_chunks, col_pct, col_acao = st.columns([3, 1, 1, 1])
+            col_nome.write(arquivo)
+            col_chunks.write(str(qtd_chunks))
+            col_pct.write(f"{percentual:.1f}%")
+            if col_acao.button("🗑️ Remover", key=f"remover_{arquivo}"):
+                ferramentas.colecao.delete(where={"arquivo": arquivo})
+                st.cache_resource.clear()
+                st.success(f"{arquivo} removido da base.")
+                st.rerun()
+
+    st.divider()
+    st.subheader("📊 Estatísticas")
+
+    tamanho_mb = calcular_tamanho_pasta_mb(CHROMA_DIR)
+    total_feedbacks = contar_feedbacks(st.session_state["username"])
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total de chunks", total_chunks_admin)
+    col2.metric("Documentos únicos", len(contagem_por_arquivo))
+    col3.metric("Tamanho da base", f"{tamanho_mb:.2f} MB")
+    col4.metric("Feedbacks coletados", total_feedbacks)
+
+    st.divider()
+    st.subheader("📝 Feedbacks recentes")
+
+    feedbacks = carregar_feedbacks(st.session_state["username"])
+    if not feedbacks:
+        st.write("Nenhum feedback coletado ainda.")
+    else:
+        for registro in feedbacks[-10:][::-1]:
+            emoji_avaliacao = "👍" if registro.get("avaliacao") == "positiva" else "👎"
+            resposta_truncada = registro.get("resposta", "")[:100]
+            with st.container(border=True):
+                st.markdown(f"**Pergunta:** {registro.get('pergunta', '')}")
+                st.markdown(f"**Resposta:** {resposta_truncada}...")
+                st.markdown(
+                    f"{emoji_avaliacao} {registro.get('avaliacao', '')} — "
+                    f"{registro.get('timestamp', '')}"
+                )
+
+        caminho_feedback_atual = arquivo_feedback(st.session_state["username"])
+        if caminho_feedback_atual.exists():
+            with open(caminho_feedback_atual, "rb") as f:
+                st.download_button(
+                    "⬇️ Exportar feedbacks",
+                    data=f.read(),
+                    file_name=caminho_feedback_atual.name,
+                    mime="application/jsonl",
+                )
+
+with tab_comparar:
+    st.subheader("🔍 Comparação de laudos")
+    st.caption(
+        "Envie dois laudos do mesmo imóvel ou obra para identificar novos apontamentos, "
+        "apontamentos resolvidos, evolução de patologias e mudanças nas recomendações."
+    )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        laudo_anterior = st.file_uploader(
+            "Laudo anterior (mais antigo)", type=["pdf"], key="upload_laudo_anterior"
+        )
+    with col_b:
+        laudo_atual = st.file_uploader(
+            "Laudo atual (mais recente)", type=["pdf"], key="upload_laudo_atual"
+        )
+
+    if st.button("🔍 Comparar laudos", disabled=not (laudo_anterior and laudo_atual)):
+        caminho_anterior, caminho_atual = _salvar_temp_comparacao(laudo_anterior, laudo_atual)
+        try:
+            resultado_1 = ferramentas.ler_documento(str(caminho_anterior))
+            resultado_2 = ferramentas.ler_documento(str(caminho_atual))
+            if "erro" in resultado_1 or "erro" in resultado_2:
+                st.error("Não foi possível ler um dos laudos enviados.")
+            else:
+                st.markdown(f"**Comparando:** {resultado_1['arquivo']} → {resultado_2['arquivo']}")
+                texto_resultado = st.write_stream(
+                    comparar_laudos_stream(
+                        resultado_1["texto"],
+                        resultado_2["texto"],
+                        resultado_1["arquivo"],
+                        resultado_2["arquivo"],
+                    )
+                )
+                st.session_state.ultima_comparacao = {
+                    "nome_anterior": resultado_1["arquivo"],
+                    "nome_atual": resultado_2["arquivo"],
+                    "texto": texto_resultado,
+                }
+        finally:
+            caminho_anterior.unlink(missing_ok=True)
+            caminho_atual.unlink(missing_ok=True)
+    elif st.session_state.ultima_comparacao:
+        c = st.session_state.ultima_comparacao
+        st.markdown(f"**Última comparação:** {c['nome_anterior']} → {c['nome_atual']}")
+        st.markdown(c["texto"])
