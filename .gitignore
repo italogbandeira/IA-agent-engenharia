@@ -1,0 +1,60 @@
+# Ambiente virtual Python
+.venv/
+venv/
+env/
+
+# Base vetorial (gerada pela ingestão, não vai no repo)
+chroma_db/
+
+# Dados de feedback (contém conversas reais dos usuários)
+feedback.jsonl
+
+# Arquivos temporários de áudio
+temp_audio_resposta.mp3
+temp_*.pdf
+*.wav
+*.mp3
+*.ogg
+
+# Cache do Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Cache do Whisper
+~/.cache/whisper/
+
+# Arquivos de ambiente e segredos
+.env
+.env.local
+*.env
+
+# Arquivos do sistema operacional
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Arquivos temporários do VS Code
+.vscode/settings.json
+
+# Arquivos de teste temporários
+teste_*.py
+buscar_trecho.py
+ver_trecho.py
+ocr_nbr.py
+indexar_txt.py
+escala.js
+
+# Texto extraído por OCR (pode ser regenerado)
+documentos/*_ocr.txt
+
+# PDF da NBR escaneado (grande, pode ser baixado novamente)
+# documentos/nbr5674_manutencao.pdf
+
+# Laudos temporários enviados via interface
+documentos/temp_*
