@@ -696,6 +696,11 @@ with tab_comparar:
             "Laudo atual (mais recente)", type=["pdf"], key="upload_laudo_atual"
         )
 
+    st.caption(
+        "⏱️ A comparação processa os dois laudos com uma janela de contexto ampla e pode "
+        "levar vários minutos (o processamento roda localmente, sem GPU)."
+    )
+
     if st.button("🔍 Comparar laudos", disabled=not (laudo_anterior and laudo_atual)):
         caminho_anterior, caminho_atual = _salvar_temp_comparacao(laudo_anterior, laudo_atual)
         try:
