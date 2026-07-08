@@ -13,6 +13,7 @@ from pathlib import Path
 
 import chromadb
 import edge_tts
+import ollama
 import streamlit as st
 import whisper
 
@@ -24,7 +25,8 @@ from agente import (
     gerar_resposta_com_contexto_stream,
     reescrever_pergunta,
 )
-from ferramentas import Ferramentas
+from ferramentas import EMBED_MODEL, Ferramentas
+from ingestao import dividir_em_chunks
 
 CHROMA_DIR = "chroma_db"
 COLLECTION_NAME = "normas"
@@ -33,6 +35,8 @@ MENSAGEM_ANALISE = "analise os documentos anexados"
 ARQUIVO_FEEDBACK = Path("feedback.jsonl")
 VOZ_TTS = "pt-BR-FranciscaNeural"
 CAMINHO_AUDIO_RESPOSTA = "temp_audio_resposta.mp3"
+CHUNK_SIZE_UPLOAD = 300
+CHUNK_OVERLAP_UPLOAD = 100
 
 
 @st.cache_resource
@@ -47,10 +51,44 @@ def carregar_whisper():
     return whisper.load_model("small")
 
 
+_CORRECOES_TRANSCRICAO = {
+    "IRP": "ART",
+    "ERP": "ART",
+    "ARP": "ART",
+    "arte ": "ART ",
+    "artes ": "ARTs ",
+    "CRIAR": "CREA",
+    " cria ": " CREA ",
+    "COFEA": "CONFEA",
+    "CONFIA": "CONFEA",
+    "COMFEA": "CONFEA",
+    "NBR ": "NBR ",
+}
+
+
+def corrigir_transcricao(texto: str) -> str:
+    for errado, correto in _CORRECOES_TRANSCRICAO.items():
+        texto = texto.replace(errado, correto)
+    return texto
+
+
 def transcrever_audio(caminho_audio: str) -> str:
     modelo = carregar_whisper()
-    resultado = modelo.transcribe(caminho_audio, language="pt")
-    return resultado["text"].strip()
+    resultado = modelo.transcribe(
+        caminho_audio,
+        language="pt",
+        initial_prompt=(
+            "Conversa técnica sobre engenharia civil e normas brasileiras. "
+            "Termos comuns: ART, ARTs, CREA, CONFEA, NBR, NBR 5674, laudo, "
+            "vistoria predial, manutenção preventiva, manutenção corretiva, "
+            "impermeabilização, infiltração, responsabilidade técnica, "
+            "Anotação de Responsabilidade Técnica, acervo técnico, "
+            "fiscalização, obra, serviço, profissional habilitado."
+        ),
+    )
+    texto = resultado["text"].strip()
+    texto = corrigir_transcricao(texto)
+    return texto
 
 
 async def _texto_para_audio_async(texto: str, caminho_saida: str):
@@ -86,6 +124,10 @@ if "tarefa_por_voz" not in st.session_state:
     st.session_state.tarefa_por_voz = None
 if "ultimo_audio_hash" not in st.session_state:
     st.session_state.ultimo_audio_hash = None
+if "processando" not in st.session_state:
+    st.session_state.processando = False
+if "mostrar_opcao_indexar" not in st.session_state:
+    st.session_state.mostrar_opcao_indexar = False
 
 with st.sidebar:
     st.subheader("📄 Upload de documentos")
@@ -202,6 +244,53 @@ def analisar_documentos_anexados(
     return gerar_resposta_com_contexto_stream(tarefa, contexto, historico), fontes
 
 
+def indexar_documentos_anexados(caminhos: list[Path], ferramentas: Ferramentas) -> bool:
+    cliente = chromadb.PersistentClient(path=CHROMA_DIR)
+    colecao = cliente.get_collection(COLLECTION_NAME)
+
+    barra = st.progress(0.0, text="Indexando documentos...")
+    algum_indexado = False
+
+    try:
+        for indice_arquivo, caminho in enumerate(caminhos):
+            resultado = ferramentas.ler_documento(str(caminho))
+            if "erro" in resultado:
+                continue
+
+            nome_arquivo = resultado["arquivo"]
+
+            existentes = colecao.get(where={"arquivo": nome_arquivo})
+            if existentes["ids"]:
+                continue  # já indexado anteriormente — evita duplicatas
+
+            chunks = dividir_em_chunks(
+                resultado["texto"], CHUNK_SIZE_UPLOAD, CHUNK_OVERLAP_UPLOAD
+            )
+
+            documentos, embeddings, ids, metadados = [], [], [], []
+            for i, chunk in enumerate(chunks):
+                resposta_emb = ollama.embeddings(model=EMBED_MODEL, prompt=chunk)
+                documentos.append(chunk)
+                embeddings.append(resposta_emb["embedding"])
+                ids.append(f"upload_{Path(caminho).stem}_chunk_{i}")
+                metadados.append({"arquivo": nome_arquivo, "trecho": i})
+
+            if documentos:
+                colecao.add(
+                    documents=documentos,
+                    embeddings=embeddings,
+                    ids=ids,
+                    metadatas=metadados,
+                )
+                algum_indexado = True
+
+            barra.progress((indice_arquivo + 1) / len(caminhos))
+    finally:
+        barra.empty()
+
+    return algum_indexado
+
+
 def exibir_fontes(fontes: list[dict]):
     if not fontes:
         return
@@ -226,7 +315,7 @@ def salvar_feedback(pergunta: str, resposta: str, fontes: list[dict], avaliacao:
 
 
 def exibir_feedback(indice: int, pergunta: str, resposta: str, fontes: list[dict]):
-    if st.session_state.feedback_enviado:
+    if st.session_state.feedback_enviado or st.session_state.processando:
         return
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -268,6 +357,7 @@ if st.session_state.tarefa_por_voz:
 tarefa = st.chat_input("Digite sua pergunta...") or tarefa
 
 if tarefa:
+    st.session_state.processando = True
     st.session_state.feedback_enviado = False
 
     with st.chat_message("user"):
@@ -290,6 +380,9 @@ if tarefa:
             resposta = "".join(resposta)
         exibir_fontes(fontes)
 
+        if tarefa == MENSAGEM_ANALISE and st.session_state.arquivos_salvos:
+            st.session_state.mostrar_opcao_indexar = True
+
         if ler_respostas_em_voz:
             try:
                 texto_para_audio(resposta, CAMINHO_AUDIO_RESPOSTA)
@@ -302,5 +395,31 @@ if tarefa:
         st.session_state.historico.append(
             {"role": "assistant", "content": resposta, "fontes": fontes}
         )
+        st.session_state.processando = False
         indice_nova_resposta = len(st.session_state.historico) - 1
         exibir_feedback(indice_nova_resposta, tarefa, resposta, fontes)
+
+if st.session_state.mostrar_opcao_indexar and st.session_state.arquivos_salvos:
+    st.info(
+        "💾 Deseja adicionar esse documento à base de conhecimento para consultas futuras?"
+    )
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("✅ Sim, indexar"):
+            algum_indexado = indexar_documentos_anexados(
+                st.session_state.arquivos_salvos, ferramentas
+            )
+            st.session_state.mostrar_opcao_indexar = False
+            if algum_indexado:
+                st.cache_resource.clear()
+                st.success(
+                    "✅ Documento indexado com sucesso! Agora faz parte da base de conhecimento."
+                )
+            else:
+                st.info("Esse documento já estava indexado na base de conhecimento.")
+            st.rerun()
+    with col2:
+        if st.button("❌ Não"):
+            st.session_state.mostrar_opcao_indexar = False
+            st.toast("Documento não indexado.")
+            st.rerun()
