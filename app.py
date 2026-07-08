@@ -26,7 +26,7 @@ from agente import (
     reescrever_pergunta,
 )
 from ferramentas import EMBED_MODEL, Ferramentas
-from ingestao import dividir_em_chunks
+from ingestao import dividir_em_chunks, ingerir_pdfs
 
 CHROMA_DIR = "chroma_db"
 COLLECTION_NAME = "normas"
@@ -185,6 +185,31 @@ with st.sidebar:
                 Path(caminho).unlink(missing_ok=True)
             st.session_state.arquivos_salvos = []
             st.rerun()
+
+    st.divider()
+    st.subheader("🗄️ Base de conhecimento")
+
+    total_chunks = ferramentas.colecao.count()
+    st.caption(f"📚 {total_chunks} chunks indexados")
+
+    if st.button("🔄 Reindexar normas"):
+        try:
+            with st.spinner("Reindexando documentos da pasta /documentos..."):
+                ingerir_pdfs()
+            st.cache_resource.clear()
+            st.success("✅ Base atualizada com sucesso!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Erro ao reindexar: {e}")
+
+    with st.expander("📋 Documentos indexados"):
+        metadados_existentes = ferramentas.colecao.get(include=["metadatas"])["metadatas"]
+        arquivos_unicos = sorted({meta["arquivo"] for meta in metadados_existentes})
+        if arquivos_unicos:
+            for arquivo in arquivos_unicos:
+                st.markdown(f"• {arquivo}")
+        else:
+            st.write("Nenhum documento indexado.")
 
     st.divider()
     st.subheader("🎤 Entrada por voz")
