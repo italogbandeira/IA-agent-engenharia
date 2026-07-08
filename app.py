@@ -37,6 +37,26 @@ VOZ_TTS = "pt-BR-FranciscaNeural"
 CAMINHO_AUDIO_RESPOSTA = "temp_audio_resposta.mp3"
 CHUNK_SIZE_UPLOAD = 300
 CHUNK_OVERLAP_UPLOAD = 100
+ARQUIVO_HISTORICO = Path("historico_conversa.json")
+HISTORICO_MAX_MENSAGENS = 50
+
+
+def carregar_historico() -> list[dict]:
+    try:
+        if ARQUIVO_HISTORICO.exists():
+            with open(ARQUIVO_HISTORICO, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def salvar_historico(historico: list[dict]):
+    try:
+        with open(ARQUIVO_HISTORICO, "w", encoding="utf-8") as f:
+            json.dump(historico[-HISTORICO_MAX_MENSAGENS:], f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
 
 
 @st.cache_resource
@@ -113,7 +133,7 @@ except Exception:
     st.stop()
 
 if "historico" not in st.session_state:
-    st.session_state.historico = []
+    st.session_state.historico = carregar_historico()
 if "arquivos_salvos" not in st.session_state:
     st.session_state.arquivos_salvos = []
 if "disparar_analise" not in st.session_state:
@@ -130,6 +150,12 @@ if "mostrar_opcao_indexar" not in st.session_state:
     st.session_state.mostrar_opcao_indexar = False
 
 with st.sidebar:
+    if st.button("🗑️ Limpar conversa"):
+        st.session_state.historico = []
+        ARQUIVO_HISTORICO.unlink(missing_ok=True)
+        st.rerun()
+
+    st.divider()
     st.subheader("📄 Upload de documentos")
     uploads = st.file_uploader(
         "Envie um ou mais PDFs", type=["pdf"], accept_multiple_files=True
@@ -395,6 +421,7 @@ if tarefa:
         st.session_state.historico.append(
             {"role": "assistant", "content": resposta, "fontes": fontes}
         )
+        salvar_historico(st.session_state.historico)
         st.session_state.processando = False
         indice_nova_resposta = len(st.session_state.historico) - 1
         exibir_feedback(indice_nova_resposta, tarefa, resposta, fontes)

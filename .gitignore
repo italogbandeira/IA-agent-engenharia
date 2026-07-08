@@ -9,6 +9,9 @@ chroma_db/
 # Dados de feedback (contém conversas reais dos usuários)
 feedback.jsonl
 
+# Histórico persistente de conversas (contém conversas reais dos usuários)
+historico_conversa.json
+
 # Arquivos temporários de áudio
 temp_audio_resposta.mp3
 temp_*.pdf
