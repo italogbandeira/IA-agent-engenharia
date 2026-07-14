@@ -39,6 +39,7 @@ __pycache__/
 # Credenciais e perfis de usuário (login local)
 usuarios/perfis/
 usuarios/usuarios.json
+usuarios/tokens/
 
 # Arquivos do sistema operacional
 .DS_Store

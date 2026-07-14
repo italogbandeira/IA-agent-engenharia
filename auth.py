@@ -36,6 +36,11 @@ def verificar_login(usuario: str, senha: str) -> bool:
     return usuario in usuarios and _verificar_hash(senha, usuarios[usuario]["senha"])
 
 
+def verificar_usuario_existe(usuario: str) -> bool:
+    usuarios = carregar_usuarios()
+    return usuario in usuarios
+
+
 def cadastrar_usuario(usuario: str, senha: str, nome: str) -> bool:
     usuarios = carregar_usuarios()
     if usuario in usuarios:

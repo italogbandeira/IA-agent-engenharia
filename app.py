@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
 import tempfile
 from collections import Counter
 from datetime import datetime
@@ -35,6 +36,7 @@ from auth import (
     gerar_contexto_perfil,
     get_nome,
     verificar_login,
+    verificar_usuario_existe,
 )
 from ferramentas import EMBED_MODEL, Ferramentas
 from ingestao import dividir_em_chunks, ingerir_pdfs
@@ -141,8 +143,44 @@ def texto_para_audio(texto: str, caminho_saida: str):
 
 st.set_page_config(page_title="Agente de Normas Técnicas")
 
+TOKENS_DIR = Path("usuarios/tokens")
+
+
+def salvar_token(usuario: str):
+    TOKENS_DIR.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_hex(16)
+    (TOKENS_DIR / f"{token}.txt").write_text(usuario, encoding="utf-8")
+    st.query_params["session_token"] = token
+
+
+def carregar_token() -> str | None:
+    token = st.query_params.get("session_token")
+    if not token:
+        return None
+    try:
+        caminho = TOKENS_DIR / f"{token}.txt"
+        if caminho.exists():
+            return caminho.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    return None
+
+
+def limpar_token():
+    token = st.query_params.get("session_token")
+    if token:
+        caminho = TOKENS_DIR / f"{token}.txt"
+        caminho.unlink(missing_ok=True)
+        del st.query_params["session_token"]
+
+
 if "usuario_logado" not in st.session_state:
-    st.session_state.usuario_logado = None
+    usuario_token = carregar_token()
+    if usuario_token and verificar_usuario_existe(usuario_token):
+        st.session_state.usuario_logado = usuario_token
+        atualizar_perfil(usuario_token, {"nova_sessao": True})
+    else:
+        st.session_state.usuario_logado = None
 
 if not st.session_state.usuario_logado:
     st.title("🔐 Agente de Normas Técnicas")
@@ -156,6 +194,7 @@ if not st.session_state.usuario_logado:
         if submitted:
             if verificar_login(usuario, senha):
                 st.session_state.usuario_logado = usuario
+                salvar_token(usuario)
                 atualizar_perfil(usuario, {"nova_sessao": True})
                 st.rerun()
             else:
@@ -204,6 +243,7 @@ with st.sidebar:
     nome = get_nome(st.session_state.usuario_logado)
     st.caption(f"👤 {nome}")
     if st.button("Sair", key="logout"):
+        limpar_token()
         st.session_state.usuario_logado = None
         st.session_state.historico = []
         st.rerun()
@@ -474,6 +514,38 @@ def exibir_fontes(fontes: list[dict]):
             st.markdown(linha)
 
 
+def calcular_confianca(fontes, resposta):
+    if not fontes or fontes[0].get("trecho") == "documento completo":
+        return None  # sem medidor para análise de documentos completos
+
+    melhor_score = max((f.get("similaridade", 0) for f in fontes), default=0)
+    n_arquivos = len(set(f["arquivo"] for f in fontes))
+
+    termos_incerteza = [
+        "não encontrei", "não tenho certeza", "desculpe",
+        "não sei", "não está disponível", "não há informação"
+    ]
+    incerteza = any(t in resposta.lower() for t in termos_incerteza)
+
+    score_final = melhor_score
+    if n_arquivos > 1:
+        score_final = min(score_final + 0.05, 1.0)
+    if incerteza:
+        score_final = max(score_final - 0.20, 0.0)
+
+    percentual = int(score_final * 100)
+
+    if score_final >= 0.75:
+        return {"nivel": "Alta", "cor": "🟢", "percentual": percentual,
+                "detalhe": f"{n_arquivos} fonte(s) consultada(s)"}
+    elif score_final >= 0.60:
+        return {"nivel": "Média", "cor": "🟡", "percentual": percentual,
+                "detalhe": f"{n_arquivos} fonte(s) consultada(s)"}
+    else:
+        return {"nivel": "Baixa", "cor": "🔴", "percentual": percentual,
+                "detalhe": "Poucos trechos relevantes encontrados"}
+
+
 def salvar_feedback(username: str, pergunta: str, resposta: str, fontes: list[dict], avaliacao: str):
     registro = {
         "timestamp": datetime.now().isoformat(),
@@ -514,6 +586,9 @@ with tab_chat:
             st.markdown(mensagem["content"])
             if mensagem["role"] == "assistant":
                 exibir_fontes(mensagem.get("fontes", []))
+                if mensagem.get("confianca"):
+                    c = mensagem["confianca"]
+                    st.caption(f"{c['cor']} Confiança **{c['nivel']}** ({c['percentual']}%)")
                 if indice == len(st.session_state.historico) - 1:
                     pergunta_anterior = (
                         st.session_state.historico[indice - 1]["content"] if indice > 0 else ""
@@ -563,6 +638,13 @@ with tab_chat:
                 resposta = "".join(resposta)
             exibir_fontes(fontes)
 
+            confianca = calcular_confianca(fontes, resposta)
+            if confianca:
+                st.caption(
+                    f"{confianca['cor']} Confiança **{confianca['nivel']}** "
+                    f"({confianca['percentual']}%) — {confianca['detalhe']}"
+                )
+
             atualizar_perfil(st.session_state.usuario_logado, {"tema": classificar_intencao(tarefa)})
 
             if tarefa == MENSAGEM_ANALISE and st.session_state.arquivos_salvos:
@@ -586,7 +668,7 @@ with tab_chat:
 
             st.session_state.historico.append({"role": "user", "content": tarefa})
             st.session_state.historico.append(
-                {"role": "assistant", "content": resposta, "fontes": fontes}
+                {"role": "assistant", "content": resposta, "fontes": fontes, "confianca": confianca}
             )
             salvar_historico(st.session_state.usuario_logado, st.session_state.historico)
             st.session_state.processando = False
