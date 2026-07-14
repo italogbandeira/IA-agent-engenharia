@@ -36,8 +36,9 @@ __pycache__/
 .env.local
 *.env
 
-# Credenciais de login (contém hash de senha e chave do cookie)
-auth_config.yaml
+# Credenciais e perfis de usuário (login local)
+usuarios/perfis/
+usuarios/usuarios.json
 
 # Arquivos do sistema operacional
 .DS_Store

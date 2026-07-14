@@ -184,11 +184,11 @@ def gerar_resposta_com_contexto(pergunta: str, contexto_ferramenta: str, histori
 
 
 def gerar_resposta_com_contexto_stream(
-    pergunta: str, contexto_ferramenta: str, historico: list[dict]
+    pergunta: str, contexto_ferramenta: str, historico: list[dict], system_prompt: str | None = None
 ) -> Generator[str, None, None]:
     mensagem_user = f"Trechos das normas:\n\n{contexto_ferramenta}\n\nPergunta: {pergunta}"
     mensagens = (
-        [{"role": "system", "content": SYSTEM_PROMPT}]
+        [{"role": "system", "content": system_prompt if system_prompt is not None else SYSTEM_PROMPT}]
         + historico
         + [{"role": "user", "content": mensagem_user}]
     )
@@ -257,10 +257,10 @@ def _gerar_resposta_conversacional(pergunta: str, historico: list[dict]) -> str:
 
 
 def _gerar_resposta_conversacional_stream(
-    pergunta: str, historico: list[dict]
+    pergunta: str, historico: list[dict], system_prompt: str | None = None
 ) -> Generator[str, None, None]:
     mensagens = (
-        [{"role": "system", "content": SYSTEM_PROMPT}]
+        [{"role": "system", "content": system_prompt if system_prompt is not None else SYSTEM_PROMPT}]
         + historico
         + [{"role": "user", "content": pergunta}]
     )

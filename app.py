@@ -16,13 +16,11 @@ import chromadb
 import edge_tts
 import ollama
 import streamlit as st
-import streamlit_authenticator as stauth
 import whisper
-import yaml
-from yaml.loader import SafeLoader
 
 from agente import (
     LIMIAR_SIMILARIDADE,
+    SYSTEM_PROMPT,
     _REGEX_CAMINHO_PDF,
     _gerar_resposta_conversacional_stream,
     classificar_intencao,
@@ -31,11 +29,16 @@ from agente import (
     gerar_resposta_com_contexto_stream,
     reescrever_pergunta,
 )
+from auth import (
+    atualizar_perfil,
+    cadastrar_usuario,
+    gerar_contexto_perfil,
+    get_nome,
+    verificar_login,
+)
 from ferramentas import EMBED_MODEL, Ferramentas
 from ingestao import dividir_em_chunks, ingerir_pdfs
 from relatorio import gerar_relatorio_docx
-
-AUTENTICACAO_ATIVA = False  # TODO: reativar depois de corrigir o hash em auth_config.yaml
 
 CHROMA_DIR = "chroma_db"
 COLLECTION_NAME = "normas"
@@ -138,29 +141,26 @@ def texto_para_audio(texto: str, caminho_saida: str):
 
 st.set_page_config(page_title="Agente de Normas Técnicas")
 
-if AUTENTICACAO_ATIVA:
-    with open("auth_config.yaml", encoding="utf-8") as f:
-        config_auth = yaml.load(f, Loader=SafeLoader)
+if "usuario_logado" not in st.session_state:
+    st.session_state.usuario_logado = None
 
-    authenticator = stauth.Authenticate(
-        config_auth["credentials"],
-        config_auth["cookie"]["name"],
-        config_auth["cookie"]["key"],
-        config_auth["cookie"]["expiry_days"],
-        auto_hash=False,
-    )
+if not st.session_state.usuario_logado:
+    st.title("🔐 Agente de Normas Técnicas")
+    st.subheader("Faça login para continuar")
 
-    authenticator.login(location="main")
+    with st.form("form_login"):
+        usuario = st.text_input("Usuário")
+        senha = st.text_input("Senha", type="password")
+        submitted = st.form_submit_button("Entrar")
 
-    if st.session_state.get("authentication_status") is False:
-        st.error("Usuário ou senha incorretos.")
-        st.stop()
-    elif st.session_state.get("authentication_status") is None:
-        st.warning("Informe usuário e senha para acessar.")
-        st.stop()
-else:
-    st.session_state.setdefault("username", "local")
-    st.session_state.setdefault("name", "Usuário local")
+        if submitted:
+            if verificar_login(usuario, senha):
+                st.session_state.usuario_logado = usuario
+                atualizar_perfil(usuario, {"nova_sessao": True})
+                st.rerun()
+            else:
+                st.error("Usuário ou senha incorretos.")
+    st.stop()
 
 st.title("Agente de Normas Técnicas")
 st.caption("Consulte normas, analise laudos e tire dúvidas técnicas")
@@ -174,7 +174,7 @@ except Exception:
     st.stop()
 
 if "historico" not in st.session_state:
-    st.session_state.historico = carregar_historico(st.session_state["username"])
+    st.session_state.historico = carregar_historico(st.session_state.usuario_logado)
 if "arquivos_salvos" not in st.session_state:
     st.session_state.arquivos_salvos = []
 if "disparar_analise" not in st.session_state:
@@ -201,14 +201,17 @@ if "ultima_comparacao" not in st.session_state:
     st.session_state.ultima_comparacao = None
 
 with st.sidebar:
-    if AUTENTICACAO_ATIVA:
-        st.caption(f"👤 Logado como: {st.session_state.get('name', '')}")
-        authenticator.logout("🚪 Sair", location="sidebar")
-        st.divider()
+    nome = get_nome(st.session_state.usuario_logado)
+    st.caption(f"👤 {nome}")
+    if st.button("Sair", key="logout"):
+        st.session_state.usuario_logado = None
+        st.session_state.historico = []
+        st.rerun()
+    st.divider()
 
     if st.button("🗑️ Limpar conversa"):
         st.session_state.historico = []
-        arquivo_historico(st.session_state["username"]).unlink(missing_ok=True)
+        arquivo_historico(st.session_state.usuario_logado).unlink(missing_ok=True)
         st.session_state.mostrar_opcao_relatorio = False
         st.session_state.contexto_ultimo_laudo = ""
         st.session_state.arquivos_ultimo_laudo = []
@@ -311,11 +314,13 @@ with st.sidebar:
     ler_respostas_em_voz = st.toggle("🔊 Ler respostas em voz alta", value=True)
 
 
-def processar_pergunta(tarefa: str, ferramentas: Ferramentas, historico: list[dict]):
+def processar_pergunta(
+    tarefa: str, ferramentas: Ferramentas, historico: list[dict], system_prompt: str = SYSTEM_PROMPT
+):
     intencao = classificar_intencao(tarefa)
 
     if intencao in ("conversacional", "geral"):
-        return _gerar_resposta_conversacional_stream(tarefa, historico), []
+        return _gerar_resposta_conversacional_stream(tarefa, historico, system_prompt), []
 
     if intencao == "ler_documento":
         match = _REGEX_CAMINHO_PDF.search(tarefa)
@@ -325,7 +330,10 @@ def processar_pergunta(tarefa: str, ferramentas: Ferramentas, historico: list[di
             mensagem = f"Não foi possível ler o documento: {resultado['erro']}"
             return (chunk for chunk in [mensagem]), []
         fontes = [{"arquivo": resultado["arquivo"], "trecho": "documento completo"}]
-        return gerar_resposta_com_contexto_stream(tarefa, resultado["texto"], historico), fontes
+        return (
+            gerar_resposta_com_contexto_stream(tarefa, resultado["texto"], historico, system_prompt),
+            fontes,
+        )
 
     # buscar_norma
     pergunta_rag = reescrever_pergunta(tarefa, historico)
@@ -334,13 +342,17 @@ def processar_pergunta(tarefa: str, ferramentas: Ferramentas, historico: list[di
         mensagem = "Não encontrei essa informação nos documentos disponíveis."
         return (chunk for chunk in [mensagem]), []
     return (
-        gerar_resposta_com_contexto_stream(tarefa, resultado["contexto"], historico),
+        gerar_resposta_com_contexto_stream(tarefa, resultado["contexto"], historico, system_prompt),
         resultado["fontes"],
     )
 
 
 def analisar_documentos_anexados(
-    tarefa: str, ferramentas: Ferramentas, historico: list[dict], caminhos: list[Path]
+    tarefa: str,
+    ferramentas: Ferramentas,
+    historico: list[dict],
+    caminhos: list[Path],
+    system_prompt: str = SYSTEM_PROMPT,
 ):
     blocos = []
     fontes = []
@@ -354,7 +366,8 @@ def analisar_documentos_anexados(
             fontes.append({"arquivo": resultado["arquivo"], "trecho": "documento completo"})
             nomes_arquivos.append(resultado["arquivo"])
     contexto = "\n\n---\n\n".join(blocos)
-    return gerar_resposta_com_contexto_stream(tarefa, contexto, historico), fontes, contexto, nomes_arquivos
+    stream = gerar_resposta_com_contexto_stream(tarefa, contexto, historico, system_prompt)
+    return stream, fontes, contexto, nomes_arquivos
 
 
 def _salvar_temp_comparacao(arquivo_anterior, arquivo_atual) -> tuple[Path, Path]:
@@ -479,13 +492,15 @@ def exibir_feedback(indice: int, pergunta: str, resposta: str, fontes: list[dict
     col1, col2 = st.columns([1, 1])
     with col1:
         if st.button("👍 Útil", key=f"feedback_util_{indice}"):
-            salvar_feedback(st.session_state["username"], pergunta, resposta, fontes, "positiva")
+            salvar_feedback(st.session_state.usuario_logado, pergunta, resposta, fontes, "positiva")
+            atualizar_perfil(st.session_state.usuario_logado, {"feedback": "positivo"})
             st.session_state.feedback_enviado = True
             st.toast("Obrigado pelo feedback!")
             st.rerun()
     with col2:
         if st.button("👎 Não útil", key=f"feedback_nao_util_{indice}"):
-            salvar_feedback(st.session_state["username"], pergunta, resposta, fontes, "negativa")
+            salvar_feedback(st.session_state.usuario_logado, pergunta, resposta, fontes, "negativa")
+            atualizar_perfil(st.session_state.usuario_logado, {"feedback": "negativo"})
             st.session_state.feedback_enviado = True
             st.toast("Anotado. Vamos melhorar!")
             st.rerun()
@@ -526,21 +541,29 @@ with tab_chat:
             st.markdown(tarefa)
 
         with st.chat_message("assistant"):
+            contexto_perfil = gerar_contexto_perfil(st.session_state.usuario_logado)
+            system_prompt_personalizado = SYSTEM_PROMPT + (
+                f"\n\nContexto do usuário: {contexto_perfil}" if contexto_perfil else ""
+            )
+
             if tarefa == MENSAGEM_ANALISE and st.session_state.arquivos_salvos:
                 stream_generator, fontes, contexto_laudo, nomes_laudo = analisar_documentos_anexados(
                     tarefa,
                     ferramentas,
                     st.session_state.historico,
                     st.session_state.arquivos_salvos,
+                    system_prompt_personalizado,
                 )
             else:
                 stream_generator, fontes = processar_pergunta(
-                    tarefa, ferramentas, st.session_state.historico
+                    tarefa, ferramentas, st.session_state.historico, system_prompt_personalizado
                 )
             resposta = st.write_stream(stream_generator)
             if not isinstance(resposta, str):
                 resposta = "".join(resposta)
             exibir_fontes(fontes)
+
+            atualizar_perfil(st.session_state.usuario_logado, {"tema": classificar_intencao(tarefa)})
 
             if tarefa == MENSAGEM_ANALISE and st.session_state.arquivos_salvos:
                 st.session_state.mostrar_opcao_indexar = True
@@ -548,6 +571,10 @@ with tab_chat:
                 st.session_state.contexto_ultimo_laudo = contexto_laudo
                 st.session_state.arquivos_ultimo_laudo = nomes_laudo
                 st.session_state.relatorio_bytes = None
+                for nome_doc in nomes_laudo:
+                    atualizar_perfil(
+                        st.session_state.usuario_logado, {"documento_analisado": nome_doc}
+                    )
 
             if ler_respostas_em_voz:
                 try:
@@ -561,7 +588,7 @@ with tab_chat:
             st.session_state.historico.append(
                 {"role": "assistant", "content": resposta, "fontes": fontes}
             )
-            salvar_historico(st.session_state["username"], st.session_state.historico)
+            salvar_historico(st.session_state.usuario_logado, st.session_state.historico)
             st.session_state.processando = False
             indice_nova_resposta = len(st.session_state.historico) - 1
             exibir_feedback(indice_nova_resposta, tarefa, resposta, fontes)
@@ -643,7 +670,7 @@ with tab_admin:
     st.subheader("📊 Estatísticas")
 
     tamanho_mb = calcular_tamanho_pasta_mb(CHROMA_DIR)
-    total_feedbacks = contar_feedbacks(st.session_state["username"])
+    total_feedbacks = contar_feedbacks(st.session_state.usuario_logado)
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total de chunks", total_chunks_admin)
@@ -654,7 +681,7 @@ with tab_admin:
     st.divider()
     st.subheader("📝 Feedbacks recentes")
 
-    feedbacks = carregar_feedbacks(st.session_state["username"])
+    feedbacks = carregar_feedbacks(st.session_state.usuario_logado)
     if not feedbacks:
         st.write("Nenhum feedback coletado ainda.")
     else:
@@ -669,7 +696,7 @@ with tab_admin:
                     f"{registro.get('timestamp', '')}"
                 )
 
-        caminho_feedback_atual = arquivo_feedback(st.session_state["username"])
+        caminho_feedback_atual = arquivo_feedback(st.session_state.usuario_logado)
         if caminho_feedback_atual.exists():
             with open(caminho_feedback_atual, "rb") as f:
                 st.download_button(
@@ -678,6 +705,18 @@ with tab_admin:
                     file_name=caminho_feedback_atual.name,
                     mime="application/jsonl",
                 )
+
+    st.divider()
+    st.subheader("👥 Usuários")
+    with st.form("form_novo_usuario"):
+        novo_usuario = st.text_input("Nome de usuário")
+        novo_nome = st.text_input("Nome completo")
+        nova_senha = st.text_input("Senha", type="password")
+        if st.form_submit_button("Cadastrar"):
+            if cadastrar_usuario(novo_usuario, nova_senha, novo_nome):
+                st.success(f"Usuário {novo_nome} cadastrado com sucesso!")
+            else:
+                st.error("Usuário já existe.")
 
 with tab_comparar:
     st.subheader("🔍 Comparação de laudos")
