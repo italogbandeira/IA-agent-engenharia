@@ -68,3 +68,6 @@ documentos/*_ocr.txt
 
 # Laudos temporários enviados via interface
 documentos/temp_*
+
+# Relatórios Word gerados sob demanda (contêm dados reais de laudos)
+relatorio_*.docx

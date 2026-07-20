@@ -5,6 +5,8 @@ Ferramentas disponíveis para o agente: busca em normas indexadas e leitura de P
 from pathlib import Path
 
 import ollama
+import requests
+from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from rank_bm25 import BM25Okapi
 
@@ -17,6 +19,13 @@ PESO_VETORIAL = 0.4
 PESO_BM25 = 0.6
 LIMIAR_SIMILARIDADE = 0.50
 CONTEXTO_MAX_CARACTERES = 12000
+
+URLS_LEGISLACAO = {
+    "lei": "https://www.planalto.gov.br/ccivil_03/leis/l{numero}.htm",
+    "lei_maiuscula": "https://www.planalto.gov.br/ccivil_03/leis/L{numero}.htm",
+    "decreto": "https://www.planalto.gov.br/ccivil_03/decreto/{numero}.htm",
+    "constituicao": "https://www.planalto.gov.br/ccivil_03/constituicao/constituicao.htm",
+}
 
 
 DESCRICAO_FERRAMENTAS = """
@@ -158,3 +167,64 @@ class Ferramentas:
             "paginas": len(reader.pages),
             "arquivo": caminho.name,
         }
+
+    def buscar_legislacao(self, identificador: str) -> dict:
+        """
+        Busca o texto de uma lei ou decreto no Portal da Legislação do Planalto.
+        identificador: ex "Lei 5194", "Lei 6496/1977", "Decreto 23569"
+        """
+        try:
+            # Normaliza o identificador
+            identificador = identificador.lower().strip()
+            numero = ''.join(filter(str.isdigit, identificador.split('/')[0]))
+
+            # Determina o tipo
+            if 'constitui' in identificador:
+                url = URLS_LEGISLACAO["constituicao"]
+            elif 'decreto' in identificador:
+                url = URLS_LEGISLACAO["decreto"].format(numero=numero)
+            else:
+                url = URLS_LEGISLACAO["lei"].format(numero=numero)
+
+            # Tenta URL minúscula primeiro, depois maiúscula
+            for tentativa_url in [url, url.replace('/l', '/L')]:
+                try:
+                    response = requests.get(tentativa_url, timeout=10,
+                        headers={"User-Agent": "Mozilla/5.0"})
+                    if response.status_code == 200:
+                        break
+                except Exception:
+                    continue
+            else:
+                return {"erro": f"Lei não encontrada: {identificador}"}
+
+            # Parse do HTML
+            # As páginas do Planalto declaram ISO-8859-1/Windows-1252, não UTF-8 —
+            # forçar 'utf-8' aqui gera texto corrompido em todo acento.
+            response.encoding = response.apparent_encoding
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            # Remove scripts e estilos
+            for tag in soup(['script', 'style', 'nav', 'header', 'footer']):
+                tag.decompose()
+
+            # Pega o texto principal
+            texto = soup.get_text(separator='\n', strip=True)
+
+            # Limpa linhas vazias excessivas
+            linhas = [l for l in texto.split('\n') if l.strip()]
+            texto_limpo = '\n'.join(linhas)
+
+            # Limita a 8000 caracteres para não sobrecarregar o contexto
+            if len(texto_limpo) > 8000:
+                texto_limpo = texto_limpo[:8000] + "\n\n[... texto truncado ...]"
+
+            return {
+                "texto": texto_limpo,
+                "url": tentativa_url,
+                "identificador": identificador,
+                "caracteres": len(texto_limpo)
+            }
+
+        except Exception as e:
+            return {"erro": f"Erro ao buscar legislação: {str(e)}"}

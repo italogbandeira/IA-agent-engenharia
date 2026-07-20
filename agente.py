@@ -41,6 +41,14 @@ SYSTEM_PROMPT = (
     "que não encontrou, sem inventar."
 )
 
+MENSAGEM_ORIENTACAO = (
+    "Pode me dar mais detalhes sobre o que você precisa?\n\n"
+    "Por exemplo:\n"
+    "- 📋 **Consultar uma norma**: 'O que diz a NBR 5674 sobre manutenção?'\n"
+    "- 📄 **Analisar um laudo**: faça upload do PDF pela sidebar\n"
+    "- 🔍 **Tirar uma dúvida técnica**: descreva o problema ou situação"
+)
+
 _SYSTEM_REWRITE = (
     "Sua única tarefa é reescrever a pergunta do usuário em uma única frase curta e direta, "
     "incorporando termos do histórico para torná-la autocontida.\n\n"
@@ -79,6 +87,43 @@ _TERMOS_GERAL = {
 
 _REGEX_CAMINHO_PDF = re.compile(r"[^\s\"']+\.pdf", re.IGNORECASE)
 
+_TERMOS_SAUDACAO = {"olá", "oi", "bom dia", "boa tarde", "boa noite"}
+
+_PRONOMES_SEM_REFERENTE = ["isso", "esse", "aquilo", "ele", "ela"]
+_REGEX_PRONOMES_SEM_REFERENTE = re.compile(
+    r"\b(" + "|".join(_PRONOMES_SEM_REFERENTE) + r")\b", re.IGNORECASE
+)
+
+_VERBOS_VAGOS = {"verifica", "analisa", "confere", "vê isso", "olha aqui"}
+
+
+def detectar_ambiguidade(pergunta: str) -> bool:
+    texto = pergunta.lower().strip()
+    palavras = texto.split()
+
+    eh_saudacao = any(termo in texto for termo in _TERMOS_SAUDACAO)
+    if len(palavras) < 5 and not eh_saudacao:
+        return True
+
+    if _REGEX_PRONOMES_SEM_REFERENTE.search(texto):
+        return True
+
+    if any(termo in texto for termo in _VERBOS_VAGOS):
+        return True
+
+    return False
+
+
+def mensagem_sem_resultado(melhor_sim: float) -> str:
+    return (
+        f"Não encontrei informação suficientemente confiável sobre esse tema "
+        f"(melhor correspondência: {melhor_sim:.0%}).\n\n"
+        f"**Possíveis razões:**\n"
+        f"- O documento com essa informação ainda não foi indexado\n"
+        f"- Tente reformular a pergunta com termos mais específicos\n\n"
+        f"**Sugestão:** adicione normas relevantes pela sidebar e reindexe."
+    )
+
 APONTAMENTOS_SYSTEM_PROMPT = (
     "Você é um engenheiro auditor especializado em normas técnicas ABNT e "
     "regulamentações do Sistema CONFEA/CREA. Sua tarefa é analisar o texto de laudo(s) "
@@ -101,6 +146,16 @@ APONTAMENTOS_SYSTEM_PROMPT = (
     "Não invente normas, números ou dados que não constam no texto fornecido."
 )
 
+MENSAGEM_ORIENTACAO = (
+    "Pode me dar mais detalhes sobre o que você precisa?\n\n"
+    "Por exemplo:\n"
+    "- 📋 **Consultar uma norma**: 'O que diz a NBR 5674 sobre manutenção?'\n"
+    "- 📄 **Analisar um laudo**: faça upload do PDF pela sidebar\n"
+    "- 🔍 **Tirar uma dúvida técnica**: descreva o problema ou situação"
+)
+
+
+
 COMPARACAO_SYSTEM_PROMPT = (
     "Você é um engenheiro auditor especializado em laudos de vistoria predial e normas "
     "técnicas ABNT. Você recebeu dois laudos do mesmo imóvel ou obra, feitos em datas "
@@ -115,6 +170,148 @@ COMPARACAO_SYSTEM_PROMPT = (
     "que não constem nos laudos. Se não for possível determinar a evolução de algum item "
     "por falta de detalhe em um dos laudos, diga isso explicitamente em vez de supor."
 )
+
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "buscar_normas",
+            "description": (
+                "Busca trechos relevantes nas normas técnicas indexadas no banco vetorial. "
+                "Use quando o usuário perguntar sobre normas, regulamentos, artigos, "
+                "requisitos técnicos, prazos, atribuições profissionais, ART, CREA, CONFEA, "
+                "NBR ou qualquer legislação de engenharia."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Pergunta ou termo técnico a buscar nas normas indexadas"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ler_documento",
+            "description": (
+                "Extrai e analisa o texto completo de um arquivo PDF. "
+                "Use quando o usuário pedir para analisar, revisar, resumir ou "
+                "verificar um documento específico como laudo, projeto ou relatório."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "caminho_pdf": {
+                        "type": "string",
+                        "description": "Caminho completo do arquivo PDF a ser lido e analisado"
+                    }
+                },
+                "required": ["caminho_pdf"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resposta_direta",
+            "description": (
+                "Responde diretamente ao usuário sem buscar documentos. "
+                "Use para saudações, perguntas sobre o próprio agente, "
+                "perguntas conversacionais ou quando o usuário já tem o contexto necessário."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mensagem": {
+                        "type": "string",
+                        "description": "Mensagem ou pergunta do usuário para resposta direta"
+                    }
+                },
+                "required": ["mensagem"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "buscar_legislacao",
+            "description": (
+                "Busca o texto completo de leis federais e decretos diretamente "
+                "no Portal da Legislação do Planalto (fonte oficial do governo). "
+                "Use quando o usuário perguntar sobre o conteúdo de uma lei específica "
+                "pelo número, como 'Lei 5.194/1966', 'Lei 6.496/1977', 'Decreto 23.569'. "
+                "Não use para normas ABNT ou resoluções do CONFEA — use buscar_normas para isso."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "identificador": {
+                        "type": "string",
+                        "description": "Identificação da lei ou decreto. Ex: 'Lei 5194', 'Decreto 23569', 'Lei 6496/1977'"
+                    }
+                },
+                "required": ["identificador"]
+            }
+        }
+    }
+]
+
+_SYSTEM_ROTEADOR = (
+    "Você é um roteador de ferramentas. Analise a mensagem do usuário e "
+    "selecione a ferramenta mais adequada. Sempre selecione uma ferramenta."
+)
+
+
+def _fallback_selecao_ferramenta(tarefa: str) -> tuple[str, dict]:
+    intencao = classificar_intencao(tarefa)
+    if intencao == "buscar_norma":
+        return "buscar_normas", {"query": tarefa}
+    if intencao == "ler_documento":
+        return "ler_documento", {"caminho_pdf": ""}
+    return "resposta_direta", {"mensagem": tarefa}
+
+
+def selecionar_ferramenta(tarefa: str, historico: list[dict]) -> tuple[str, dict]:
+    """
+    Seleciona a ferramenta a usar via tool calling do modelo. Se o modelo não
+    retornar tool_calls (ou falhar), cai no roteamento de classificar_intencao().
+    """
+    try:
+        mensagens = (
+            [{"role": "system", "content": _SYSTEM_ROTEADOR}]
+            + historico[-2:]
+            + [{"role": "user", "content": tarefa}]
+        )
+        resposta = ollama.chat(
+            model=GEN_MODEL,
+            messages=mensagens,
+            tools=TOOLS,
+            options={"temperature": 0, "num_ctx": 4096},
+        )
+        tool_calls = resposta["message"].get("tool_calls")
+        if not tool_calls:
+            return _fallback_selecao_ferramenta(tarefa)
+
+        chamada = tool_calls[0]
+        nome_ferramenta = chamada["function"]["name"]
+        argumentos = chamada["function"].get("arguments", {})
+        if isinstance(argumentos, str):
+            try:
+                argumentos = json.loads(argumentos)
+            except json.JSONDecodeError:
+                argumentos = {}
+        if not isinstance(argumentos, dict):
+            argumentos = {}
+
+        return nome_ferramenta, argumentos
+    except Exception:
+        return _fallback_selecao_ferramenta(tarefa)
 
 
 def classificar_intencao(pergunta: str) -> str:
@@ -165,10 +362,12 @@ def _truncar_historico(historico: list[dict]) -> list[dict]:
     return historico
 
 
-def gerar_resposta_com_contexto(pergunta: str, contexto_ferramenta: str, historico: list[dict]) -> str:
+def gerar_resposta_com_contexto(
+    pergunta: str, contexto_ferramenta: str, historico: list[dict], system_prompt: str | None = None
+) -> str:
     mensagem_user = f"Trechos das normas:\n\n{contexto_ferramenta}\n\nPergunta: {pergunta}"
     mensagens = (
-        [{"role": "system", "content": SYSTEM_PROMPT}]
+        [{"role": "system", "content": system_prompt if system_prompt is not None else SYSTEM_PROMPT}]
         + historico
         + [{"role": "user", "content": mensagem_user}]
     )
@@ -239,9 +438,11 @@ def comparar_laudos_stream(
         yield chunk["message"]["content"]
 
 
-def _gerar_resposta_conversacional(pergunta: str, historico: list[dict]) -> str:
+def _gerar_resposta_conversacional(
+    pergunta: str, historico: list[dict], system_prompt: str | None = None
+) -> str:
     mensagens = (
-        [{"role": "system", "content": SYSTEM_PROMPT}]
+        [{"role": "system", "content": system_prompt if system_prompt is not None else SYSTEM_PROMPT}]
         + historico
         + [{"role": "user", "content": pergunta}]
     )
@@ -314,39 +515,119 @@ def gerar_apontamentos(texto_laudo: str) -> dict:
     return dados
 
 
-def executar_tarefa(tarefa: str, ferramentas: Ferramentas, historico: list[dict]) -> dict:
-    intencao = classificar_intencao(tarefa)
-    if intencao == "buscar_norma":
+def executar_tarefa(
+    tarefa: str, ferramentas: Ferramentas, historico: list[dict], system_prompt: str | None = None
+) -> dict:
+    if detectar_ambiguidade(tarefa) and not historico:
+        return {"resposta": MENSAGEM_ORIENTACAO, "fontes": []}
+
+    nome_ferramenta, argumentos = selecionar_ferramenta(tarefa, historico)
+    if nome_ferramenta == "buscar_normas":
         print("🔍 Buscando nas normas...")
-    elif intencao == "ler_documento":
+    elif nome_ferramenta == "ler_documento":
         print("📄 Lendo documento...")
 
-    if intencao == "conversacional":
-        return {"resposta": _gerar_resposta_conversacional(tarefa, historico), "fontes": []}
+    if nome_ferramenta == "buscar_normas":
+        query = argumentos.get("query", tarefa)
+        query_final = reescrever_pergunta(query, historico)
+        resultado = ferramentas.buscar_normas(query_final)
+        if resultado["melhor_similaridade"] < LIMIAR_SIMILARIDADE:
+            return {
+                "resposta": mensagem_sem_resultado(resultado["melhor_similaridade"]),
+                "fontes": [],
+            }
+        resposta = gerar_resposta_com_contexto(tarefa, resultado["contexto"], historico, system_prompt)
+        return {"resposta": resposta, "fontes": resultado["fontes"]}
 
-    if intencao == "geral":
-        return {"resposta": _gerar_resposta_conversacional(tarefa, historico), "fontes": []}
-
-    if intencao == "ler_documento":
-        match = _REGEX_CAMINHO_PDF.search(tarefa)
-        caminho = match.group(0) if match else ""
+    if nome_ferramenta == "ler_documento":
+        caminho = argumentos.get("caminho_pdf", "")
+        if not caminho:
+            match = _REGEX_CAMINHO_PDF.search(tarefa)
+            caminho = match.group(0) if match else ""
+        if not caminho:
+            return {
+                "resposta": "Não identifiquei o arquivo a ser analisado. Faça upload do PDF pela sidebar.",
+                "fontes": [],
+            }
         resultado = ferramentas.ler_documento(caminho)
         if "erro" in resultado:
             return {
                 "resposta": f"Não foi possível ler o documento: {resultado['erro']}",
                 "fontes": [],
             }
-        resposta = gerar_resposta_com_contexto(tarefa, resultado["texto"], historico)
+        resposta = gerar_resposta_com_contexto(tarefa, resultado["texto"], historico, system_prompt)
         fontes = [{"arquivo": resultado["arquivo"], "trecho": "documento completo"}]
         return {"resposta": resposta, "fontes": fontes}
 
-    # buscar_norma
-    pergunta_rag = reescrever_pergunta(tarefa, historico)
-    resultado = ferramentas.buscar_normas(pergunta_rag)
-    if resultado["melhor_similaridade"] < LIMIAR_SIMILARIDADE:
-        return {"resposta": "Não encontrei essa informação nos documentos disponíveis.", "fontes": []}
-    resposta = gerar_resposta_com_contexto(tarefa, resultado["contexto"], historico)
-    return {"resposta": resposta, "fontes": resultado["fontes"]}
+    if nome_ferramenta == "buscar_legislacao":
+        identificador = argumentos.get("identificador", tarefa)
+        resultado = ferramentas.buscar_legislacao(identificador)
+        if "erro" in resultado:
+            return {
+                "resposta": f"Não encontrei a legislação: {resultado['erro']}",
+                "fontes": [],
+            }
+        contexto = f"[Fonte: {resultado['url']}]\n\n{resultado['texto']}"
+        fontes = [{"arquivo": resultado["url"], "trecho": 0, "similaridade": 1.0}]
+        resposta = gerar_resposta_com_contexto(tarefa, contexto, historico, system_prompt)
+        return {"resposta": resposta, "fontes": fontes}
+
+    # resposta_direta
+    resposta = _gerar_resposta_conversacional(tarefa, historico, system_prompt)
+    return {"resposta": resposta, "fontes": []}
+
+
+def executar_tarefa_stream(
+    tarefa: str, ferramentas: Ferramentas, historico: list[dict], system_prompt: str | None = None
+):
+    """Versão em streaming de executar_tarefa(). Retorna (stream_generator, fontes)."""
+    if detectar_ambiguidade(tarefa) and not historico:
+        return (chunk for chunk in [MENSAGEM_ORIENTACAO]), []
+
+    nome_ferramenta, argumentos = selecionar_ferramenta(tarefa, historico)
+
+    if nome_ferramenta == "buscar_normas":
+        query = argumentos.get("query", tarefa)
+        query_final = reescrever_pergunta(query, historico)
+        resultado = ferramentas.buscar_normas(query_final)
+        if resultado["melhor_similaridade"] < LIMIAR_SIMILARIDADE:
+            mensagem = mensagem_sem_resultado(resultado["melhor_similaridade"])
+            return (chunk for chunk in [mensagem]), []
+        stream = gerar_resposta_com_contexto_stream(
+            tarefa, resultado["contexto"], historico, system_prompt
+        )
+        return stream, resultado["fontes"]
+
+    if nome_ferramenta == "ler_documento":
+        caminho = argumentos.get("caminho_pdf", "")
+        if not caminho:
+            match = _REGEX_CAMINHO_PDF.search(tarefa)
+            caminho = match.group(0) if match else ""
+        if not caminho:
+            mensagem = "Não identifiquei o arquivo a ser analisado. Faça upload do PDF pela sidebar."
+            return (chunk for chunk in [mensagem]), []
+        resultado = ferramentas.ler_documento(caminho)
+        if "erro" in resultado:
+            mensagem = f"Não foi possível ler o documento: {resultado['erro']}"
+            return (chunk for chunk in [mensagem]), []
+        fontes = [{"arquivo": resultado["arquivo"], "trecho": "documento completo"}]
+        stream = gerar_resposta_com_contexto_stream(tarefa, resultado["texto"], historico, system_prompt)
+        return stream, fontes
+
+    if nome_ferramenta == "buscar_legislacao":
+        identificador = argumentos.get("identificador", tarefa)
+        resultado = ferramentas.buscar_legislacao(identificador)
+        if "erro" in resultado:
+            mensagem = f"Não encontrei a legislação: {resultado['erro']}"
+            return (chunk for chunk in [mensagem]), []
+        contexto = f"[Fonte: {resultado['url']}]\n\n{resultado['texto']}"
+        fontes = [{"arquivo": resultado["url"], "trecho": 0, "similaridade": 1.0}]
+        stream = gerar_resposta_com_contexto_stream(tarefa, contexto, historico, system_prompt)
+        return stream, fontes
+
+    # resposta_direta
+    stream = _gerar_resposta_conversacional_stream(tarefa, historico, system_prompt)
+    return stream, []
 
 
 def loop_agente(ferramentas: Ferramentas):

@@ -1,75 +1,226 @@
 """
-Geração de relatório de apontamentos técnicos (.docx) a partir da
-análise de um ou mais laudos.
+Geração de relatório Word (.docx) de análise de conformidade a partir
+da resposta do agente sobre um laudo analisado.
 """
 
+import re
 from datetime import datetime
-from io import BytesIO
 
+import ollama
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import RGBColor
+from docx.shared import Inches, Pt, RGBColor
 
-_COR_GRAVIDADE = {
-    "alta": RGBColor(0xC0, 0x00, 0x00),
-    "média": RGBColor(0xB8, 0x86, 0x00),
-    "media": RGBColor(0xB8, 0x86, 0x00),
-    "baixa": RGBColor(0x2E, 0x7D, 0x32),
-}
+from agente import GEN_MODEL
+from ferramentas import Ferramentas
+
+LIMIAR_SIMILARIDADE_APONTAMENTO = 0.60
+MAX_PROBLEMAS = 8
 
 
-def gerar_relatorio_docx(nomes_arquivos: list[str], dados: dict) -> bytes:
-    """Monta um relatório de apontamentos em .docx e retorna os bytes do arquivo."""
-    documento = Document()
+def gerar_relatorio_docx(
+    nome_documento: str,
+    resumo_laudo: str,
+    apontamentos: list[dict],
+    usuario: str,
+    caminho_saida: str
+) -> str:
+    """
+    Gera relatório Word com:
+    - Cabeçalho institucional (SEDUH)
+    - Resumo do laudo analisado
+    - Tabela de apontamentos de conformidade
+    - Rodapé com data e responsável
 
-    titulo = documento.add_heading("Relatório de Apontamentos Técnicos", level=0)
-    titulo.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    apontamentos é uma lista de dicts:
+    [{"item": "ART", "status": "Conforme", "norma": "Res. 1137", "observacao": "..."}]
 
-    documento.add_paragraph(
-        f"Documento(s) analisado(s): {', '.join(nomes_arquivos) if nomes_arquivos else 'não identificado'}"
-    )
-    documento.add_paragraph(f"Data de geração: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-    nota = documento.add_paragraph()
-    nota_run = nota.add_run(
-        "Gerado automaticamente pelo Agente de Normas Técnicas (SEDUH). "
-        "Revisão de um profissional habilitado é obrigatória antes de assinatura e arquivamento."
-    )
-    nota_run.italic = True
+    Retorna o caminho do arquivo gerado.
+    """
+    doc = Document()
 
-    documento.add_heading("Resumo", level=1)
-    documento.add_paragraph(dados.get("resumo") or "Sem resumo disponível.")
+    # Margens
+    for section in doc.sections:
+        section.top_margin = Inches(1)
+        section.bottom_margin = Inches(1)
+        section.left_margin = Inches(1.2)
+        section.right_margin = Inches(1.2)
 
-    documento.add_heading("Apontamentos", level=1)
-    apontamentos = dados.get("apontamentos", [])
+    # Cabeçalho
+    cabecalho = doc.add_heading("SEDUH — Secretaria de Desenvolvimento Urbano e Habitação", 0)
+    cabecalho.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    if not apontamentos:
-        documento.add_paragraph("Nenhum apontamento identificado no texto analisado.")
+    subtitulo = doc.add_paragraph("Relatório de Análise de Conformidade Técnica")
+    subtitulo.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subtitulo.runs[0].bold = True
+    subtitulo.runs[0].font.size = Pt(13)
+
+    doc.add_paragraph()
+
+    # Metadados
+    meta = doc.add_paragraph()
+    meta.add_run("Documento analisado: ").bold = True
+    meta.add_run(nome_documento)
+
+    meta2 = doc.add_paragraph()
+    meta2.add_run("Data da análise: ").bold = True
+    meta2.add_run(datetime.now().strftime("%d/%m/%Y %H:%M"))
+
+    meta3 = doc.add_paragraph()
+    meta3.add_run("Responsável: ").bold = True
+    meta3.add_run(usuario)
+
+    doc.add_paragraph()
+
+    # Resumo do laudo
+    doc.add_heading("1. Resumo do Laudo Analisado", level=1)
+    doc.add_paragraph(resumo_laudo)
+
+    doc.add_paragraph()
+
+    # Apontamentos de conformidade
+    doc.add_heading("2. Apontamentos de Conformidade com Normas", level=1)
+
+    if apontamentos:
+        tabela = doc.add_table(rows=1, cols=4)
+        tabela.style = "Table Grid"
+
+        # Cabeçalho da tabela
+        headers = ["Item", "Status", "Norma de Referência", "Observação"]
+        for i, header in enumerate(headers):
+            cell = tabela.rows[0].cells[i]
+            cell.text = header
+            cell.paragraphs[0].runs[0].bold = True
+
+        # Linhas de apontamento
+        for ap in apontamentos:
+            row = tabela.add_row()
+            row.cells[0].text = ap.get("item", "")
+            row.cells[1].text = ap.get("status", "")
+            row.cells[2].text = ap.get("norma", "")
+            row.cells[3].text = ap.get("observacao", "")
+
+            # Colore status
+            status = ap.get("status", "").lower()
+            run = row.cells[1].paragraphs[0].runs
+            if run:
+                if "conforme" in status and "não" not in status:
+                    run[0].font.color.rgb = RGBColor(0, 128, 0)   # verde
+                elif "não conforme" in status:
+                    run[0].font.color.rgb = RGBColor(200, 0, 0)   # vermelho
+                else:
+                    run[0].font.color.rgb = RGBColor(180, 120, 0) # amarelo
     else:
-        for indice, item in enumerate(apontamentos, start=1):
-            documento.add_heading(f"{indice}. {item.get('problema', 'Apontamento')}", level=2)
+        doc.add_paragraph("Nenhum apontamento identificado.")
 
-            gravidade = (item.get("gravidade") or "não classificada").strip().lower()
-            p_gravidade = documento.add_paragraph()
-            p_gravidade.add_run("Gravidade: ").bold = True
-            run_valor = p_gravidade.add_run(gravidade.capitalize())
-            run_valor.bold = True
-            cor = _COR_GRAVIDADE.get(gravidade)
-            if cor:
-                run_valor.font.color.rgb = cor
+    doc.add_paragraph()
 
-            p_norma = documento.add_paragraph()
-            p_norma.add_run("Norma violada: ").bold = True
-            p_norma.add_run(item.get("norma_violada") or "Não identificada")
+    # Rodapé
+    doc.add_paragraph("_" * 60)
+    rodape = doc.add_paragraph()
+    rodape.add_run("Nota: ").bold = True
+    rodape.add_run(
+        "Este relatório foi gerado com auxílio de sistema de IA e deve ser "
+        "revisado e assinado pelo profissional responsável (ART obrigatória)."
+    )
+    rodape.runs[1].font.size = Pt(9)
 
-            p_rec = documento.add_paragraph()
-            p_rec.add_run("Recomendação: ").bold = True
-            p_rec.add_run(item.get("recomendacao") or "—")
+    doc.save(caminho_saida)
+    return caminho_saida
 
-    documento.add_paragraph()
-    rodape = documento.add_paragraph()
-    rodape_run = rodape.add_run("Assinatura do responsável técnico: _________________________________")
-    rodape_run.italic = True
 
-    buffer = BytesIO()
-    documento.save(buffer)
-    return buffer.getvalue()
+def extrair_apontamentos_da_resposta(resposta: str) -> list[dict]:
+    """
+    Tenta extrair apontamentos estruturados do texto de resposta do agente.
+    Retorna lista de dicts com item, status, norma, observacao.
+    """
+    apontamentos = []
+    linhas = resposta.split("\n")
+
+    for linha in linhas:
+        linha = linha.strip().lstrip("*•-").strip()
+        if not linha:
+            continue
+
+        # Detecta padrões de conformidade
+        status = "A verificar"
+        if any(t in linha.lower() for t in ["conforme", "atende", "adequado", "correto"]):
+            if any(t in linha.lower() for t in ["não", "nao", "in"]):
+                status = "Não conforme"
+            else:
+                status = "Conforme"
+        elif any(t in linha.lower() for t in ["não", "nao", "ausente", "falta", "irregular"]):
+            status = "Não conforme"
+        elif any(t in linha.lower() for t in ["verificar", "analisar", "pendente"]):
+            status = "Pendente"
+
+        # Detecta norma mencionada
+        norma = ""
+        for padrao in [r"NBR[\s\d]+", r"Resolução[\s\w\.]+", r"Art\.?\s*\d+", r"CONFEA\s*\d+"]:
+            match = re.search(padrao, linha, re.IGNORECASE)
+            if match:
+                norma = match.group(0).strip()
+                break
+
+        if len(linha) > 10:
+            apontamentos.append({
+                "item": linha[:60] + ("..." if len(linha) > 60 else ""),
+                "status": status,
+                "norma": norma,
+                "observacao": linha[60:120] if len(linha) > 60 else ""
+            })
+
+    return apontamentos[:15]  # máximo 15 apontamentos
+
+
+def extrair_problemas(resposta_analise: str) -> list[str]:
+    """
+    Pede ao modelo uma lista objetiva dos problemas técnicos citados na
+    análise, um por linha, pra depois buscar a norma aplicável de cada um.
+    """
+    prompt = (
+        "Da análise abaixo, extraia uma lista com os problemas técnicos encontrados. "
+        "Retorne apenas os problemas, um por linha, sem numeração, sem explicação "
+        f"adicional.\n\nAnálise:\n{resposta_analise}"
+    )
+    try:
+        resposta = ollama.chat(
+            model=GEN_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0, "num_ctx": 4096},
+        )
+        linhas = resposta["message"]["content"].strip().split("\n")
+        problemas = [linha.strip().lstrip("*•-").strip() for linha in linhas if linha.strip()]
+        return problemas[:MAX_PROBLEMAS]
+    except Exception:
+        return []
+
+
+def _extrair_trecho_contexto(contexto: str) -> str:
+    primeiro_bloco = contexto.split("\n\n---\n\n")[0]
+    linhas = primeiro_bloco.split("\n", 1)
+    if len(linhas) > 1 and linhas[0].startswith("[Fonte:"):
+        return linhas[1].strip()
+    return primeiro_bloco.strip()
+
+
+def buscar_norma_para_problema(problema: str, ferramentas: Ferramentas) -> dict:
+    """Busca na base vetorial a norma mais relevante para um problema identificado."""
+    resultado = ferramentas.buscar_normas(problema)
+
+    if resultado["melhor_similaridade"] >= LIMIAR_SIMILARIDADE_APONTAMENTO and resultado["fontes"]:
+        fonte = resultado["fontes"][0]
+        trecho = _extrair_trecho_contexto(resultado["contexto"])
+        return {
+            "item": problema[:60],
+            "status": "A verificar",
+            "norma": fonte["arquivo"],
+            "observacao": trecho[:100],
+        }
+
+    return {
+        "item": problema[:60],
+        "status": "A verificar",
+        "norma": "Sem norma indexada",
+        "observacao": "",
+    }

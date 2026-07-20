@@ -15,19 +15,22 @@ from pathlib import Path
 
 import chromadb
 import edge_tts
+import httpx
 import ollama
 import streamlit as st
 import whisper
 
 from agente import (
     LIMIAR_SIMILARIDADE,
+    MENSAGEM_ORIENTACAO,
     SYSTEM_PROMPT,
     _REGEX_CAMINHO_PDF,
     _gerar_resposta_conversacional_stream,
     classificar_intencao,
     comparar_laudos_stream,
-    gerar_apontamentos,
+    detectar_ambiguidade,
     gerar_resposta_com_contexto_stream,
+    mensagem_sem_resultado,
     reescrever_pergunta,
 )
 from auth import (
@@ -40,7 +43,12 @@ from auth import (
 )
 from ferramentas import EMBED_MODEL, Ferramentas
 from ingestao import dividir_em_chunks, ingerir_pdfs
-from relatorio import gerar_relatorio_docx
+from relatorio import (
+    buscar_norma_para_problema,
+    extrair_apontamentos_da_resposta,
+    extrair_problemas,
+    gerar_relatorio_docx,
+)
 
 CHROMA_DIR = "chroma_db"
 COLLECTION_NAME = "normas"
@@ -228,16 +236,16 @@ if "processando" not in st.session_state:
     st.session_state.processando = False
 if "mostrar_opcao_indexar" not in st.session_state:
     st.session_state.mostrar_opcao_indexar = False
-if "mostrar_opcao_relatorio" not in st.session_state:
-    st.session_state.mostrar_opcao_relatorio = False
-if "contexto_ultimo_laudo" not in st.session_state:
-    st.session_state.contexto_ultimo_laudo = ""
-if "arquivos_ultimo_laudo" not in st.session_state:
-    st.session_state.arquivos_ultimo_laudo = []
-if "relatorio_bytes" not in st.session_state:
-    st.session_state.relatorio_bytes = None
+if "ultima_resposta_analise" not in st.session_state:
+    st.session_state.ultima_resposta_analise = None
+if "ultimo_documento_analisado" not in st.session_state:
+    st.session_state.ultimo_documento_analisado = None
+if "apontamentos_gerados" not in st.session_state:
+    st.session_state.apontamentos_gerados = []
 if "ultima_comparacao" not in st.session_state:
     st.session_state.ultima_comparacao = None
+if "historico_confiancas" not in st.session_state:
+    st.session_state.historico_confiancas = []
 
 with st.sidebar:
     nome = get_nome(st.session_state.usuario_logado)
@@ -252,10 +260,10 @@ with st.sidebar:
     if st.button("🗑️ Limpar conversa"):
         st.session_state.historico = []
         arquivo_historico(st.session_state.usuario_logado).unlink(missing_ok=True)
-        st.session_state.mostrar_opcao_relatorio = False
-        st.session_state.contexto_ultimo_laudo = ""
-        st.session_state.arquivos_ultimo_laudo = []
-        st.session_state.relatorio_bytes = None
+        st.session_state.ultima_resposta_analise = None
+        st.session_state.ultimo_documento_analisado = None
+        st.session_state.apontamentos_gerados = []
+        st.session_state.historico_confiancas = []
         st.rerun()
 
     st.divider()
@@ -315,6 +323,43 @@ with st.sidebar:
             st.write("Nenhum documento indexado.")
 
     st.divider()
+    st.subheader("📈 Sua sessão")
+
+    total_perguntas_sessao = sum(
+        1 for m in st.session_state.historico if m["role"] == "user"
+    )
+
+    hoje = datetime.now().date().isoformat()
+    total_feedbacks_hoje = 0
+    caminho_feedback_sessao = arquivo_feedback(st.session_state.usuario_logado)
+    if caminho_feedback_sessao.exists():
+        with open(caminho_feedback_sessao, "r", encoding="utf-8") as f:
+            for linha in f:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    registro = json.loads(linha)
+                except json.JSONDecodeError:
+                    continue
+                if registro.get("timestamp", "").startswith(hoje):
+                    total_feedbacks_hoje += 1
+
+    st.metric("Perguntas feitas", total_perguntas_sessao)
+    if st.session_state.historico_confiancas:
+        media = sum(c["percentual"] for c in st.session_state.historico_confiancas) \
+            / len(st.session_state.historico_confiancas)
+        st.metric("Confiança média", f"{media:.0f}%")
+    else:
+        st.metric("Confiança média", "—")
+    st.metric("Feedbacks dados", total_feedbacks_hoje)
+
+    if st.session_state.historico_confiancas:
+        ultimas = st.session_state.historico_confiancas[-5:]
+        emojis = " ".join(c["cor"] for c in ultimas)
+        st.caption(f"Últimas respostas: {emojis}")
+
+    st.divider()
     st.subheader("🎤 Entrada por voz")
 
     if hasattr(st, "audio_input"):
@@ -344,8 +389,11 @@ with st.sidebar:
                 if texto_transcrito:
                     st.session_state.tarefa_por_voz = texto_transcrito
                     st.rerun()
-            except Exception as e:
-                st.error(f"Erro ao transcrever o áudio: {e}")
+            except Exception:
+                st.warning(
+                    "🎤 Não foi possível transcrever o áudio. "
+                    "Tente falar mais devagar ou use o campo de texto."
+                )
             finally:
                 os.unlink(caminho_tmp)  # Deleta manualmente após o uso
 
@@ -357,10 +405,14 @@ with st.sidebar:
 def processar_pergunta(
     tarefa: str, ferramentas: Ferramentas, historico: list[dict], system_prompt: str = SYSTEM_PROMPT
 ):
+    """Retorna (stream_generator, fontes, eh_orientacao)."""
+    if detectar_ambiguidade(tarefa) and not historico:
+        return (chunk for chunk in [MENSAGEM_ORIENTACAO]), [], True
+
     intencao = classificar_intencao(tarefa)
 
     if intencao in ("conversacional", "geral"):
-        return _gerar_resposta_conversacional_stream(tarefa, historico, system_prompt), []
+        return _gerar_resposta_conversacional_stream(tarefa, historico, system_prompt), [], False
 
     if intencao == "ler_documento":
         match = _REGEX_CAMINHO_PDF.search(tarefa)
@@ -368,22 +420,32 @@ def processar_pergunta(
         resultado = ferramentas.ler_documento(caminho)
         if "erro" in resultado:
             mensagem = f"Não foi possível ler o documento: {resultado['erro']}"
-            return (chunk for chunk in [mensagem]), []
+            return (chunk for chunk in [mensagem]), [], False
         fontes = [{"arquivo": resultado["arquivo"], "trecho": "documento completo"}]
         return (
             gerar_resposta_com_contexto_stream(tarefa, resultado["texto"], historico, system_prompt),
             fontes,
+            False,
         )
 
     # buscar_norma
+    n_docs = len(set(m["arquivo"] for m in ferramentas.todos_metas))
+    st.caption(f"🔍 Buscando em {ferramentas.colecao.count()} chunks de {n_docs} documentos...")
+
     pergunta_rag = reescrever_pergunta(tarefa, historico)
     resultado = ferramentas.buscar_normas(pergunta_rag)
     if resultado["melhor_similaridade"] < LIMIAR_SIMILARIDADE:
-        mensagem = "Não encontrei essa informação nos documentos disponíveis."
-        return (chunk for chunk in [mensagem]), []
+        mensagem = mensagem_sem_resultado(resultado["melhor_similaridade"])
+        return (chunk for chunk in [mensagem]), [], False
+
+    fontes = resultado["fontes"]
+    score_medio = sum(f["similaridade"] for f in fontes) / len(fontes) if fontes else 0
+    st.caption(f"📖 Usando {len(fontes)} trechos — score médio: {score_medio:.2f}")
+
     return (
         gerar_resposta_com_contexto_stream(tarefa, resultado["contexto"], historico, system_prompt),
-        resultado["fontes"],
+        fontes,
+        False,
     )
 
 
@@ -503,6 +565,22 @@ def carregar_feedbacks(username: str) -> list[dict]:
     return registros
 
 
+def escrever_stream_com_tratamento(stream_generator):
+    """st.write_stream com mensagem amigável se o Ollama estiver fora do ar."""
+    try:
+        resposta = st.write_stream(stream_generator)
+    except (ConnectionError, httpx.ConnectError):
+        st.error(
+            "⚠️ Não foi possível conectar ao modelo de linguagem. "
+            "Verifique se o Ollama está rodando e tente novamente."
+        )
+        st.info("💡 Abra um terminal e execute: `ollama serve`")
+        st.stop()
+    if not isinstance(resposta, str):
+        resposta = "".join(resposta)
+    return resposta
+
+
 def exibir_fontes(fontes: list[dict]):
     if not fontes:
         return
@@ -553,6 +631,7 @@ def salvar_feedback(username: str, pergunta: str, resposta: str, fontes: list[di
         "resposta": resposta,
         "fontes": [fonte["arquivo"] for fonte in fontes],
         "avaliacao": avaliacao,
+        "confianca": st.session_state.get("ultima_confianca", None),
     }
     with open(arquivo_feedback(username), "a", encoding="utf-8") as f:
         f.write(json.dumps(registro, ensure_ascii=False) + "\n")
@@ -597,6 +676,17 @@ with tab_chat:
                         indice, pergunta_anterior, mensagem["content"], mensagem.get("fontes", [])
                     )
 
+    st.markdown("""
+<script>
+    window.onload = function() {
+        const messages = document.querySelectorAll('[data-testid="stChatMessage"]');
+        if (messages.length > 0) {
+            messages[messages.length - 1].scrollIntoView({ behavior: 'smooth' });
+        }
+    }
+</script>
+""", unsafe_allow_html=True)
+
     tarefa = None
     if st.session_state.disparar_analise:
         tarefa = MENSAGEM_ANALISE
@@ -621,6 +711,7 @@ with tab_chat:
                 f"\n\nContexto do usuário: {contexto_perfil}" if contexto_perfil else ""
             )
 
+            eh_orientacao = False
             if tarefa == MENSAGEM_ANALISE and st.session_state.arquivos_salvos:
                 stream_generator, fontes, contexto_laudo, nomes_laudo = analisar_documentos_anexados(
                     tarefa,
@@ -630,33 +721,48 @@ with tab_chat:
                     system_prompt_personalizado,
                 )
             else:
-                stream_generator, fontes = processar_pergunta(
+                stream_generator, fontes, eh_orientacao = processar_pergunta(
                     tarefa, ferramentas, st.session_state.historico, system_prompt_personalizado
                 )
-            resposta = st.write_stream(stream_generator)
-            if not isinstance(resposta, str):
-                resposta = "".join(resposta)
-            exibir_fontes(fontes)
+            resposta = escrever_stream_com_tratamento(stream_generator)
 
-            confianca = calcular_confianca(fontes, resposta)
-            if confianca:
-                st.caption(
-                    f"{confianca['cor']} Confiança **{confianca['nivel']}** "
-                    f"({confianca['percentual']}%) — {confianca['detalhe']}"
-                )
+            confianca = None
+            if not eh_orientacao:
+                exibir_fontes(fontes)
+
+                confianca = calcular_confianca(fontes, resposta)
+                st.session_state.ultima_confianca = confianca
+                if confianca:
+                    st.session_state.historico_confiancas.append(confianca)
+                    st.caption(
+                        f"{confianca['cor']} Confiança **{confianca['nivel']}** "
+                        f"({confianca['percentual']}%) — {confianca['detalhe']}"
+                    )
+                    st.caption(
+                        f"_Baseado em {len(fontes)} trecho(s) com confiança "
+                        f"{confianca['nivel'].lower()}_"
+                    )
 
             atualizar_perfil(st.session_state.usuario_logado, {"tema": classificar_intencao(tarefa)})
 
             if tarefa == MENSAGEM_ANALISE and st.session_state.arquivos_salvos:
                 st.session_state.mostrar_opcao_indexar = True
-                st.session_state.mostrar_opcao_relatorio = True
-                st.session_state.contexto_ultimo_laudo = contexto_laudo
-                st.session_state.arquivos_ultimo_laudo = nomes_laudo
-                st.session_state.relatorio_bytes = None
+                st.session_state.ultima_resposta_analise = resposta
+                st.session_state.ultimo_documento_analisado = (
+                    nomes_laudo[0] if nomes_laudo else "documento"
+                )
                 for nome_doc in nomes_laudo:
                     atualizar_perfil(
                         st.session_state.usuario_logado, {"documento_analisado": nome_doc}
                     )
+
+                with st.spinner("🔍 Buscando normas aplicáveis..."):
+                    problemas = extrair_problemas(resposta)
+                    apontamentos = [
+                        buscar_norma_para_problema(problema, ferramentas) for problema in problemas
+                    ]
+                st.session_state.apontamentos_gerados = apontamentos
+                st.info(f"✅ {len(apontamentos)} apontamentos identificados com normas de referência.")
 
             if ler_respostas_em_voz:
                 try:
@@ -700,31 +806,39 @@ with tab_chat:
                 st.toast("Documento não indexado.")
                 st.rerun()
 
-    if st.session_state.mostrar_opcao_relatorio and st.session_state.contexto_ultimo_laudo:
+    if st.session_state.get("ultima_resposta_analise"):
         st.divider()
-        st.subheader("📝 Relatório de apontamentos")
+        st.subheader("📄 Relatório de conformidade")
 
-        if st.button("📝 Gerar relatório de apontamentos (.docx)"):
-            with st.spinner("Extraindo apontamentos e montando o relatório..."):
-                try:
-                    dados_apontamentos = gerar_apontamentos(st.session_state.contexto_ultimo_laudo)
-                    st.session_state.relatorio_bytes = gerar_relatorio_docx(
-                        st.session_state.arquivos_ultimo_laudo, dados_apontamentos
+        resposta_analise = st.session_state.ultima_resposta_analise
+        nome_doc = st.session_state.get("ultimo_documento_analisado", "documento")
+
+        if st.button("📄 Gerar Relatório Word"):
+            with st.spinner("Gerando relatório..."):
+                apontamentos = st.session_state.apontamentos_gerados or extrair_apontamentos_da_resposta(
+                    resposta_analise
+                )
+                caminho = (
+                    f"relatorio_{Path(nome_doc).stem}_{datetime.now().strftime('%Y%m%d_%H%M')}.docx"
+                )
+
+                gerar_relatorio_docx(
+                    nome_documento=nome_doc,
+                    resumo_laudo=resposta_analise,
+                    apontamentos=apontamentos,
+                    usuario=get_nome(st.session_state.usuario_logado),
+                    caminho_saida=caminho,
+                )
+
+                with open(caminho, "rb") as f:
+                    st.download_button(
+                        label="⬇️ Baixar Relatório",
+                        data=f.read(),
+                        file_name=caminho,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     )
-                    qtd_apontamentos = len(dados_apontamentos.get("apontamentos", []))
-                    st.success(f"✅ Relatório gerado com {qtd_apontamentos} apontamento(s).")
-                except Exception as e:
-                    st.session_state.relatorio_bytes = None
-                    st.error(f"Erro ao gerar relatório: {e}")
 
-        if st.session_state.relatorio_bytes:
-            nome_relatorio = f"relatorio_apontamentos_{datetime.now().strftime('%Y%m%d_%H%M')}.docx"
-            st.download_button(
-                "⬇️ Baixar relatório",
-                data=st.session_state.relatorio_bytes,
-                file_name=nome_relatorio,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
+                Path(caminho).unlink()  # remove arquivo temporário após download
 
 with tab_admin:
     st.subheader("📚 Documentos na base")
@@ -831,7 +945,7 @@ with tab_comparar:
                 st.error("Não foi possível ler um dos laudos enviados.")
             else:
                 st.markdown(f"**Comparando:** {resultado_1['arquivo']} → {resultado_2['arquivo']}")
-                texto_resultado = st.write_stream(
+                texto_resultado = escrever_stream_com_tratamento(
                     comparar_laudos_stream(
                         resultado_1["texto"],
                         resultado_2["texto"],
